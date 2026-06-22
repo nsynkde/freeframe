@@ -96,9 +96,20 @@ class FFmpegTranscoder(BaseTranscoder):
             hls_dir = work_dir / "hls"
             hls_dir.mkdir()
 
-            # Build filter_complex and map args
+            # Detect audio stream presence
+            probe_cmd = [
+                "ffprobe", "-v", "quiet", "-print_format", "json",
+                "-show_streams", "-select_streams", "a:0", input_url,
+            ]
+            probe_result = subprocess.run(probe_cmd, capture_output=True, text=True, timeout=60)
+            has_audio = bool(
+                probe_result.returncode == 0
+                and json.loads(probe_result.stdout or "{}").get("streams")
+            )
+
+            # Build filter_complex and map args.
             # Use force_original_aspect_ratio=decrease to preserve aspect ratio,
-            # then pad to even dimensions required by libx264
+            # then pad to even dimensions required by libx264.
             split_outputs = "".join(f"[v{i}]" for i in range(len(qualities)))
             filter_complex = f"[v:0]split={len(qualities)}{split_outputs};"
             filter_complex += ";".join(
@@ -114,12 +125,19 @@ class FFmpegTranscoder(BaseTranscoder):
             for i, quality in enumerate(qualities):
                 scale, crf = QUALITY_MAP[quality]
                 ffmpeg_cmd += [
-                    "-map", f"[{quality}]", "-map", "a:0",
-                    f"-c:v:{i}", "libx264", f"-crf", str(crf), "-preset", "fast",
+                    "-map", f"[{quality}]",
+                    f"-c:v:{i}", "libx264", "-crf", str(crf), "-preset", "fast",
                     "-force_key_frames", "expr:gte(t,n_forced*2)",
                 ]
+                if has_audio:
+                    ffmpeg_cmd += ["-map", "a:0"]
 
-            segment_dir = hls_dir / "%v"
+            # %v expands to the variant stream index (0, 1, 2 …), not the quality label.
+            # Directories must be named accordingly.
+            var_stream_map = " ".join(
+                f"v:{i},a:{i}" if has_audio else f"v:{i}"
+                for i in range(len(qualities))
+            )
             ffmpeg_cmd += [
                 "-f", "hls",
                 "-hls_time", "2",
@@ -127,14 +145,14 @@ class FFmpegTranscoder(BaseTranscoder):
                 "-hls_flags", "independent_segments",
                 "-hls_segment_type", "mpegts",
                 "-master_pl_name", "master.m3u8",
-                "-var_stream_map", " ".join(f"v:{i},a:{i}" for i in range(len(qualities))),
+                "-var_stream_map", var_stream_map,
                 "-hls_segment_filename", str(hls_dir / "%v" / "seg_%03d.ts"),
                 str(hls_dir / "%v" / "playlist.m3u8"),
             ]
 
-            # Create per-quality directories
-            for q in qualities:
-                (hls_dir / q).mkdir(exist_ok=True)
+            # Create directories matching the %v indices FFmpeg will expand to
+            for i in range(len(qualities)):
+                (hls_dir / str(i)).mkdir(exist_ok=True)
 
             # Timeout scales with expected duration - 4 hours for very large files
             subprocess.run(ffmpeg_cmd, check=True, capture_output=True, timeout=14400)

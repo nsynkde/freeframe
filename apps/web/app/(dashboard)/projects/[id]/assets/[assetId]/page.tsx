@@ -28,6 +28,7 @@ import {
   Loader2,
   Columns2,
   Upload,
+  X,
 } from 'lucide-react'
 import Link from 'next/link'
 import { cn } from '@/lib/utils'
@@ -56,6 +57,39 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
   const [activeTab, setActiveTab] = useState<'comments' | 'fields'>('comments')
   const [sidebarOpen, setSidebarOpen] = useState(true)
   const deepLinkApplied = useRef(false)
+
+  // Compare mode — driven by ?compare=<versionId> URL param
+  const compareVersionId = searchParams.get('compare')
+  const otherVersions = versions?.filter(
+    (v) => v.id !== currentVersion?.id && v.processing_status === 'ready',
+  ) ?? []
+  const compareVersion = versions?.find((v) => v.id === compareVersionId) ?? null
+  const [comparePickerOpen, setComparePickerOpen] = useState(false)
+  const comparePickerRef = useRef<HTMLDivElement>(null)
+
+  useEffect(() => {
+    if (!comparePickerOpen) return
+    const handleClick = (e: MouseEvent) => {
+      if (comparePickerRef.current && !comparePickerRef.current.contains(e.target as Node))
+        setComparePickerOpen(false)
+    }
+    document.addEventListener('mousedown', handleClick)
+    return () => document.removeEventListener('mousedown', handleClick)
+  }, [comparePickerOpen])
+
+  const selectCompare = (versionId: string) => {
+    const params = new URLSearchParams(searchParams.toString())
+    params.set('compare', versionId)
+    router.push(`?${params.toString()}`)
+    setComparePickerOpen(false)
+  }
+
+  const clearCompare = () => {
+    const params = new URLSearchParams(searchParams.toString())
+    params.delete('compare')
+    const qs = params.toString()
+    router.push(qs ? `?${qs}` : window.location.pathname)
+  }
 
   // Fetch folder tree to build the folder path for the breadcrumb
   const { data: folderTree } = useSWR<FolderTreeNode[]>(
@@ -267,6 +301,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             assetId={asset.id}
             comments={comments}
             className="flex-1 min-h-0"
+            compareVersionId={compareVersionId}
             overlay={
               <>
                 <AnnotationOverlay key={focusedCommentId ?? 'none'} />
@@ -383,6 +418,55 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             <Upload className="h-3.5 w-3.5" />
             New Version
           </button>
+
+          {/* Compare button — video only, shown when ≥2 ready versions exist */}
+          {asset.asset_type === 'video' && otherVersions.length > 0 && (
+            <div className="relative" ref={comparePickerRef}>
+              {compareVersionId ? (
+                <button
+                  onClick={clearCompare}
+                  className="inline-flex items-center gap-1.5 rounded-md px-2.5 h-8 text-xs font-medium bg-accent/15 border border-accent/30 text-accent hover:bg-accent/25 transition-colors"
+                  title="Exit compare mode"
+                >
+                  <Columns2 className="h-3.5 w-3.5" />
+                  {compareVersion ? `v${compareVersion.version_number}` : 'Compare'}
+                  <X className="h-3 w-3" />
+                </button>
+              ) : (
+                <button
+                  onClick={() => {
+                    if (otherVersions.length === 1) {
+                      selectCompare(otherVersions[0].id)
+                    } else {
+                      setComparePickerOpen((p) => !p)
+                    }
+                  }}
+                  className="inline-flex items-center gap-1.5 rounded-md px-2.5 h-8 text-xs font-medium border border-border text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors"
+                  title="Compare versions"
+                >
+                  <Columns2 className="h-3.5 w-3.5" />
+                  Compare
+                </button>
+              )}
+              {comparePickerOpen && (
+                <div className="absolute top-full right-0 mt-1 z-50 w-44 rounded-xl border border-white/10 bg-[#2a2a30] shadow-2xl py-1.5 animate-in fade-in zoom-in-95 duration-100">
+                  <div className="px-3 py-2 text-[11px] text-text-tertiary uppercase tracking-wider font-medium">
+                    Compare with
+                  </div>
+                  {otherVersions.map((v) => (
+                    <button
+                      key={v.id}
+                      onClick={() => selectCompare(v.id)}
+                      className="flex w-full items-center px-3 py-2 text-[13px] text-text-secondary hover:bg-white/5 transition-colors"
+                    >
+                      v{v.version_number}
+                    </button>
+                  ))}
+                </div>
+              )}
+            </div>
+          )}
+
           <ShareDialog assetId={asset.id} assetName={asset.name} projectId={projectId} asset={asset} />
           <button
             onClick={() => setSidebarOpen((p) => !p)}

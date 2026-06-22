@@ -16,6 +16,7 @@ import { cn, formatTime, formatTimecode, formatFrames } from "@/lib/utils";
 import { api } from "@/lib/api";
 import { useReviewStore, type TimeFormat } from "@/stores/review-store";
 import { useVideoPlayer } from "@/hooks/use-video-player";
+import { useHlsVideo } from "@/hooks/use-hls-video";
 import { useReview } from "./review-provider";
 import { ProgressBar } from "./progress-bar";
 import type { Comment } from "@/types";
@@ -33,6 +34,8 @@ interface VideoPlayerProps {
   className?: string;
   /** Pre-fetched stream URL (for share mode — skips authenticated API call) */
   initialStreamUrl?: string | null;
+  /** Version ID to compare against (renders split layout with shared controls) */
+  compareVersionId?: string | null;
 }
 
 // ─── Video frame constraint ──────────────────────────────────────────────────
@@ -65,7 +68,6 @@ function VideoFrameConstraint({
       const vh = video.videoHeight;
 
       if (!vw || !vh) {
-        // Video metadata not loaded yet — fill container
         setStyle({ position: "absolute", inset: 0 });
         return;
       }
@@ -76,13 +78,11 @@ function VideoFrameConstraint({
       let renderW: number, renderH: number, offsetX: number, offsetY: number;
 
       if (videoAspect > containerAspect) {
-        // Video wider than container — letterbox top/bottom
         renderW = cw;
         renderH = cw / videoAspect;
         offsetX = 0;
         offsetY = (ch - renderH) / 2;
       } else {
-        // Video taller than container — letterbox left/right
         renderH = ch;
         renderW = ch * videoAspect;
         offsetX = (cw - renderW) / 2;
@@ -123,15 +123,23 @@ function VideoFrameConstraint({
 
 const SPEED_OPTIONS = [0.5, 0.75, 1, 1.25, 1.5, 2] as const;
 
+const API_BASE = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+
+function resolveUrl(url: string): string {
+  return url.startsWith("/") ? `${API_BASE}${url}` : url;
+}
+
 export function VideoPlayer({
   assetId,
   comments = [],
   overlay,
   className,
   initialStreamUrl,
+  compareVersionId,
 }: VideoPlayerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
+  const [compareStreamUrl, setCompareStreamUrl] = useState<string | null>(null);
   const [loop, setLoop] = useState(false);
 
   const { isDrawingMode, timeFormat, setTimeFormat, setPlayheadTime } =
@@ -140,7 +148,6 @@ export function VideoPlayer({
   const [timeFormatOpen, setTimeFormatOpen] = useState(false);
   const timeFormatRef = useRef<HTMLDivElement>(null);
 
-  // Close time format dropdown on outside click
   useEffect(() => {
     if (!timeFormatOpen) return;
     const handleClick = (e: MouseEvent) => {
@@ -167,32 +174,33 @@ export function VideoPlayer({
     }
   }
 
-  // Load the stream URL — reset immediately on asset change so the old video
-  // doesn't keep playing while the new URL is being fetched.
+  // Load primary stream URL
   useEffect(() => {
     setStreamUrl(null);
     if (initialStreamUrl) {
-      const resolved = initialStreamUrl.startsWith("/")
-        ? `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}${initialStreamUrl}`
-        : initialStreamUrl;
-      setStreamUrl(resolved);
+      setStreamUrl(resolveUrl(initialStreamUrl));
       return;
     }
     api
       .get<StreamUrlResponse>(`/assets/${assetId}/stream`)
-      .then((data) => {
-        // HLS proxy returns relative paths — prepend API URL
-        const url = data.url.startsWith("/")
-          ? `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}${data.url}`
-          : data.url;
-        setStreamUrl(url);
-      })
-      .catch(() => {
-        /* stream URL errors handled by player error state */
-      });
+      .then((data) => setStreamUrl(resolveUrl(data.url)))
+      .catch(() => {});
   }, [assetId, initialStreamUrl]);
 
+  // Load compare stream URL
+  useEffect(() => {
+    if (!compareVersionId) {
+      setCompareStreamUrl(null);
+      return;
+    }
+    api
+      .get<StreamUrlResponse>(`/assets/${assetId}/stream?version_id=${compareVersionId}`)
+      .then((data) => setCompareStreamUrl(resolveUrl(data.url)))
+      .catch(() => {});
+  }, [assetId, compareVersionId]);
+
   const player = useVideoPlayer(streamUrl);
+  const compare = useHlsVideo(compareStreamUrl);
 
   const {
     videoRef,
@@ -208,22 +216,117 @@ export function VideoPlayer({
     isLoading,
     isFullscreen,
     error,
-    pause,
-    togglePlay,
-    seek,
-    setPlaybackRate,
+    pause: _pause,
+    seek: _seek,
+    setPlaybackRate: _setPlaybackRate,
     setQuality,
     setVolume,
     toggleMute,
     toggleFullscreen,
   } = player;
 
+  // ─── Synced controls — command both videos ────────────────────────────────
+
+  const play = useCallback(() => {
+    videoRef.current?.play().catch(() => {});
+    compare.videoRef.current?.play().catch(() => {});
+  }, [videoRef, compare.videoRef]);
+
+  const pause = useCallback(() => {
+    _pause();
+    compare.videoRef.current?.pause();
+  }, [_pause, compare.videoRef]);
+
+  const seek = useCallback(
+    (time: number) => {
+      _seek(time);
+      const b = compare.videoRef.current;
+      if (b) b.currentTime = Math.max(0, Math.min(time, b.duration || 0));
+    },
+    [_seek, compare.videoRef],
+  );
+
+  const togglePlay = useCallback(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    if (video.paused) {
+      play();
+    } else {
+      pause();
+    }
+  }, [videoRef, play, pause]);
+
+  const setPlaybackRate = useCallback(
+    (rate: number) => {
+      _setPlaybackRate(rate);
+      if (compare.videoRef.current)
+        compare.videoRef.current.playbackRate = rate;
+    },
+    [_setPlaybackRate, compare.videoRef],
+  );
+
+  // ─── Stall sync — pause both when either buffers, resume when both ready ──
+
+  useEffect(() => {
+    if (!compareVersionId) return;
+    const a = videoRef.current;
+    const b = compare.videoRef.current;
+    if (!a || !b) return;
+
+    const s = { a: false, b: false, wasPlaying: false };
+
+    const stallA = () => {
+      if (!s.a) {
+        s.wasPlaying = !a.paused;
+        s.a = true;
+        a.pause();
+        b.pause();
+      }
+    };
+    const stallB = () => {
+      if (!s.b) {
+        if (!s.a) s.wasPlaying = !b.paused;
+        s.b = true;
+        a.pause();
+        b.pause();
+      }
+    };
+    const tryResume = () => {
+      if (!s.a && !s.b && s.wasPlaying) {
+        s.wasPlaying = false;
+        a.play().catch(() => {});
+        b.play().catch(() => {});
+      }
+    };
+    const unstallA = () => {
+      s.a = false;
+      tryResume();
+    };
+    const unstallB = () => {
+      s.b = false;
+      tryResume();
+    };
+
+    a.addEventListener("waiting", stallA);
+    b.addEventListener("waiting", stallB);
+    a.addEventListener("canplay", unstallA);
+    b.addEventListener("canplay", unstallB);
+
+    return () => {
+      a.removeEventListener("waiting", stallA);
+      b.removeEventListener("waiting", stallB);
+      a.removeEventListener("canplay", unstallA);
+      b.removeEventListener("canplay", unstallB);
+    };
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [compareVersionId]);
+
   // Register pause handler with review provider
   useEffect(() => {
     registerPauseHandler(pause);
   }, [registerPauseHandler, pause]);
 
-  // Sync video currentTime to review store so comment input shows same timecode
+  // Sync video currentTime to review store
   const lastSyncRef = useRef(0);
   useEffect(() => {
     const now = Date.now();
@@ -302,41 +405,76 @@ export function VideoPlayer({
         className,
       )}
     >
-      {/* Video area — fills available space, object-contain preserves aspect ratio with letterbox */}
+      {/* Video area */}
       <div
         className="flex-1 relative min-h-0 bg-black overflow-hidden cursor-pointer"
         onClick={handleContainerClick}
       >
-        <video
-          ref={videoRef}
-          className={cn(
-            "absolute inset-0 w-full h-full object-contain",
-            isDrawingMode ? "pointer-events-none" : "",
+        {/* Stable flex row — primary slot is always in DOM so videoRef never remounts */}
+        <div className="flex h-full w-full">
+          {/* Slot A — always rendered, width driven by compare state */}
+          <div
+            className={cn(
+              "relative overflow-hidden",
+              compareVersionId ? "flex-1 border-r border-white/10" : "w-full",
+            )}
+          >
+            {compareVersionId && (
+              <span className="absolute top-2 left-2 z-10 text-[11px] text-white/50 bg-black/50 px-2 py-0.5 rounded select-none pointer-events-none">
+                A
+              </span>
+            )}
+            <video
+              ref={videoRef}
+              className={cn(
+                "absolute inset-0 w-full h-full object-contain",
+                isDrawingMode ? "pointer-events-none" : "",
+              )}
+              playsInline
+              preload="metadata"
+            />
+            {isLoading && (
+              <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                <div className="w-10 h-10 border-4 border-white/20 border-t-white rounded-full animate-spin" />
+              </div>
+            )}
+            {error && (
+              <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+                <p className="text-red-400 text-sm">{error}</p>
+              </div>
+            )}
+            {overlay && (
+              <VideoFrameConstraint videoRef={videoRef}>
+                {overlay}
+              </VideoFrameConstraint>
+            )}
+          </div>
+
+          {/* Slot B — only when comparing */}
+          {compareVersionId && (
+            <div className="flex-1 relative overflow-hidden">
+              <span className="absolute top-2 left-2 z-10 text-[11px] text-white/50 bg-black/50 px-2 py-0.5 rounded select-none pointer-events-none">
+                B
+              </span>
+              <video
+                ref={compare.videoRef}
+                className="absolute inset-0 w-full h-full object-contain"
+                playsInline
+                preload="metadata"
+              />
+              {compare.isLoading && (
+                <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
+                  <div className="w-8 h-8 border-4 border-white/20 border-t-white rounded-full animate-spin" />
+                </div>
+              )}
+              {compare.error && (
+                <div className="absolute inset-0 flex items-center justify-center bg-black/60">
+                  <p className="text-red-400 text-sm">{compare.error}</p>
+                </div>
+              )}
+            </div>
           )}
-          playsInline
-          preload="metadata"
-        />
-
-        {/* Loading spinner */}
-        {isLoading && (
-          <div className="absolute inset-0 flex items-center justify-center pointer-events-none">
-            <div className="w-10 h-10 border-4 border-white/20 border-t-white rounded-full animate-spin" />
-          </div>
-        )}
-
-        {/* Error state */}
-        {error && (
-          <div className="absolute inset-0 flex items-center justify-center bg-black/60">
-            <p className="text-red-400 text-sm">{error}</p>
-          </div>
-        )}
-
-        {/* Overlay slot (annotation canvas / overlay) — constrained to video frame */}
-        {overlay && (
-          <VideoFrameConstraint videoRef={videoRef}>
-            {overlay}
-          </VideoFrameConstraint>
-        )}
+        </div>
       </div>
 
       {/* Progress bar */}
@@ -351,7 +489,7 @@ export function VideoPlayer({
         />
       </div>
 
-      {/* Bottom transport bar (matches audio player style) */}
+      {/* Bottom transport bar */}
       <div className="flex items-center justify-between h-12 px-4 bg-bg-secondary/80 border-t border-border shrink-0">
         {/* Left: Play, Loop, Speed, Volume */}
         <div className="flex items-center gap-2">
@@ -462,7 +600,6 @@ export function VideoPlayer({
 
         {/* Right: Quality, Fullscreen */}
         <div className="flex items-center gap-2">
-          {/* Quality selector */}
           {qualityLevels.length > 0 && (
             <select
               value={currentQuality}
@@ -485,7 +622,6 @@ export function VideoPlayer({
             </select>
           )}
 
-          {/* Fullscreen */}
           <button
             onClick={handleFullscreen}
             className="flex h-7 w-7 items-center justify-center rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover transition-colors"
