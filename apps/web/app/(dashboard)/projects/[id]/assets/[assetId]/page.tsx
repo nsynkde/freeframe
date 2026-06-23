@@ -14,6 +14,7 @@ import { CommentInput } from '@/components/review/comment-input'
 // ApprovalBar removed for now
 import { VersionSwitcher } from '@/components/review/version-switcher'
 import { ShareDialog } from '@/components/review/share-dialog'
+import { buttonVariants } from '@/components/ui/button'
 import { useReviewStore } from '@/stores/review-store'
 import { useAuthStore } from '@/stores/auth-store'
 import { useComments } from '@/hooks/use-comments'
@@ -29,6 +30,7 @@ import {
   Columns2,
   Upload,
   X,
+  GitCompareArrows
 } from 'lucide-react'
 import Link from 'next/link'
 import { cn } from '@/lib/utils'
@@ -158,6 +160,17 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
     addReaction,
     removeReaction,
   } = useComments(asset?.id || '', currentVersion?.id || '')
+
+  const { comments: compareComments } = useComments(
+    asset?.id || '',
+    compareVersionId || '',
+  )
+
+  const [audioSource, setAudioSource] = useState<'primary' | 'compare'>('primary')
+
+  useEffect(() => {
+    setAudioSource('primary')
+  }, [compareVersionId])
 
   // Deep-link to a specific comment from notification (?commentId=...)
   // Runs once after comments are loaded — seeks to timecode, focuses comment, shows annotation
@@ -300,8 +313,12 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
           <VideoPlayer
             assetId={asset.id}
             comments={comments}
+            compareComments={compareComments}
+            onAudioSourceChange={setAudioSource}
             className="flex-1 min-h-0"
             compareVersionId={compareVersionId}
+            currentVersionNumber={currentVersion?.version_number}
+            compareVersionNumber={compareVersion?.version_number}
             overlay={
               <>
                 <AnnotationOverlay key={focusedCommentId ?? 'none'} />
@@ -410,14 +427,6 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             }}
           />
           <VersionSwitcher versions={versions} />
-          <button
-            onClick={() => versionFileInputRef.current?.click()}
-            className="inline-flex items-center gap-1.5 rounded-md px-2.5 h-8 text-xs font-medium border border-border text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors"
-            title="Upload new version"
-          >
-            <Upload className="h-3.5 w-3.5" />
-            New Version
-          </button>
 
           {/* Compare button — video only, shown when ≥2 ready versions exist */}
           {asset.asset_type === 'video' && otherVersions.length > 0 && (
@@ -425,10 +434,10 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
               {compareVersionId ? (
                 <button
                   onClick={clearCompare}
-                  className="inline-flex items-center gap-1.5 rounded-md px-2.5 h-8 text-xs font-medium bg-accent/15 border border-accent/30 text-accent hover:bg-accent/25 transition-colors"
+                  className={buttonVariants({ variant: 'destructive', size: 'sm' })}
                   title="Exit compare mode"
                 >
-                  <Columns2 className="h-3.5 w-3.5" />
+                  <GitCompareArrows className="h-3.5 w-3.5" />
                   {compareVersion ? `v${compareVersion.version_number}` : 'Compare'}
                   <X className="h-3 w-3" />
                 </button>
@@ -441,10 +450,10 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
                       setComparePickerOpen((p) => !p)
                     }
                   }}
-                  className="inline-flex items-center gap-1.5 rounded-md px-2.5 h-8 text-xs font-medium border border-border text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors"
+                  className={buttonVariants({ variant: 'primary', size: 'sm' })}
                   title="Compare versions"
                 >
-                  <Columns2 className="h-3.5 w-3.5" />
+                  <GitCompareArrows className="h-3.5 w-3.5" />
                   Compare
                 </button>
               )}
@@ -466,6 +475,15 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
               )}
             </div>
           )}
+
+          <button
+            onClick={() => versionFileInputRef.current?.click()}
+            className="inline-flex items-center gap-1.5 rounded-md px-2.5 h-8 text-xs font-medium border border-border text-text-secondary hover:text-text-primary hover:bg-bg-hover transition-colors"
+            title="Upload new version"
+          >
+            <Upload className="h-3.5 w-3.5" />
+            New Version
+          </button>
 
           <ShareDialog assetId={asset.id} assetName={asset.name} projectId={projectId} asset={asset} />
           <button
@@ -526,8 +544,18 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             <div className="flex-1 flex flex-col min-h-0 overflow-hidden">
               {activeTab === 'comments' ? (
                 <>
+                  {compareVersionId && (
+                    <div className="flex items-center gap-1.5 px-4 py-2 border-b border-border bg-bg-tertiary shrink-0">
+                      <span className="text-xs text-text-tertiary">Comments for</span>
+                      <span className="text-xs font-semibold text-text-primary">
+                        {audioSource === 'compare'
+                          ? `v${compareVersion?.version_number}`
+                          : `v${currentVersion?.version_number}`}
+                      </span>
+                    </div>
+                  )}
                   <CommentPanel
-                    comments={comments as any}
+                    comments={(audioSource === 'compare' ? compareComments : comments) as any}
                     currentUserId={user?.id}
                     onResolve={resolveComment}
                     onDelete={deleteComment}

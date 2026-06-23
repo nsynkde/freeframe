@@ -11,6 +11,10 @@ import {
   ChevronUp,
   Check,
   Repeat,
+  Columns2,
+  Rows2,
+  Layers,
+  FlipHorizontal2,
 } from "lucide-react";
 import { cn, formatTime, formatTimecode, formatFrames } from "@/lib/utils";
 import { api } from "@/lib/api";
@@ -36,6 +40,13 @@ interface VideoPlayerProps {
   initialStreamUrl?: string | null;
   /** Version ID to compare against (renders split layout with shared controls) */
   compareVersionId?: string | null;
+  /** Version numbers shown as labels in split-screen compare mode */
+  currentVersionNumber?: number | null;
+  compareVersionNumber?: number | null;
+  /** Comments for the compare version — shown in progress bar when compare is the audio source */
+  compareComments?: Comment[];
+  /** Called whenever the audio source toggles between 'primary' and 'compare' */
+  onAudioSourceChange?: (source: 'primary' | 'compare') => void;
 }
 
 // ─── Video frame constraint ──────────────────────────────────────────────────
@@ -136,6 +147,10 @@ export function VideoPlayer({
   className,
   initialStreamUrl,
   compareVersionId,
+  currentVersionNumber,
+  compareVersionNumber,
+  compareComments = [],
+  onAudioSourceChange,
 }: VideoPlayerProps) {
   const containerRef = useRef<HTMLDivElement>(null);
   const [streamUrl, setStreamUrl] = useState<string | null>(null);
@@ -147,6 +162,10 @@ export function VideoPlayer({
   const { registerPauseHandler } = useReview();
   const [timeFormatOpen, setTimeFormatOpen] = useState(false);
   const timeFormatRef = useRef<HTMLDivElement>(null);
+  const [compareMode, setCompareMode] = useState<'columns' | 'rows' | 'wipe' | 'overlay'>('columns');
+  const [wipePosition, setWipePosition] = useState(50);
+  const [overlayOpacity, setOverlayOpacity] = useState(50);
+  const [audioSource, setAudioSource] = useState<'primary' | 'compare'>('primary');
 
   useEffect(() => {
     if (!timeFormatOpen) return;
@@ -321,6 +340,28 @@ export function VideoPlayer({
     // eslint-disable-next-line react-hooks/exhaustive-deps
   }, [compareVersionId]);
 
+  // Sync muted state to whichever video is the audio source
+  useEffect(() => {
+    const a = videoRef.current;
+    const b = compare.videoRef.current;
+    if (!compareVersionId) {
+      if (b) b.muted = true;
+      return;
+    }
+    if (a) a.muted = audioSource === 'compare';
+    if (b) b.muted = audioSource !== 'compare';
+  }, [audioSource, compareVersionId, videoRef, compare.videoRef]);
+
+  // Reset audio source when compare is dismissed
+  useEffect(() => {
+    if (!compareVersionId) setAudioSource('primary');
+  }, [compareVersionId]);
+
+  // Notify parent whenever audio source changes
+  useEffect(() => {
+    onAudioSourceChange?.(audioSource);
+  }, [audioSource, onAudioSourceChange]);
+
   // Register pause handler with review provider
   useEffect(() => {
     registerPauseHandler(pause);
@@ -410,19 +451,36 @@ export function VideoPlayer({
         className="flex-1 relative min-h-0 bg-black overflow-hidden cursor-pointer"
         onClick={handleContainerClick}
       >
-        {/* Stable flex row — primary slot is always in DOM so videoRef never remounts */}
-        <div className="flex h-full w-full">
-          {/* Slot A — always rendered, width driven by compare state */}
+        {/* Both slots stay in the DOM when comparing — mode is driven by CSS only so videoRefs never remount */}
+        <div className={cn("relative flex h-full w-full", compareMode === 'rows' && "flex-col")}>
+          {/* Primary slot */}
           <div
             className={cn(
               "relative overflow-hidden",
-              compareVersionId ? "flex-1 border-r border-white/10" : "w-full",
+              !compareVersionId
+                ? "w-full"
+                : compareMode === 'columns'
+                  ? "flex-1 border-r border-white/10"
+                  : compareMode === 'rows'
+                    ? "flex-1 border-b border-white/10"
+                    : "absolute inset-0",
             )}
           >
             {compareVersionId && (
-              <span className="absolute top-2 left-2 z-10 text-[11px] text-white/50 bg-black/50 px-2 py-0.5 rounded select-none pointer-events-none">
-                A
-              </span>
+              <button
+                onClick={(e) => { e.stopPropagation(); setAudioSource('primary'); }}
+                className={cn(
+                  "absolute z-10 flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-md transition-all",
+                  compareMode === 'columns' || compareMode === 'rows' ? "top-2 left-2" : "top-2 right-2",
+                  audioSource === 'primary'
+                    ? "bg-accent text-white shadow-md shadow-accent/40"
+                    : "bg-black/70 text-white/40 border border-white/10 hover:text-white/70 hover:border-white/25",
+                )}
+                title="Play audio from this version"
+              >
+                {currentVersionNumber != null ? `v${currentVersionNumber}` : 'A'}
+                <Volume2 className="h-3 w-3" />
+              </button>
             )}
             <video
               ref={videoRef}
@@ -450,15 +508,32 @@ export function VideoPlayer({
             )}
           </div>
 
-          {/* Slot B — only when comparing */}
+          {/* Compare slot — always in DOM when compareVersionId is set */}
           {compareVersionId && (
-            <div className="flex-1 relative overflow-hidden">
-              <span className="absolute top-2 left-2 z-10 text-[11px] text-white/50 bg-black/50 px-2 py-0.5 rounded select-none pointer-events-none">
-                B
-              </span>
+            <div
+              className={cn(
+                "relative overflow-hidden",
+                compareMode === 'columns' || compareMode === 'rows' ? "flex-1" : "absolute inset-0",
+              )}
+              style={compareMode === 'wipe' ? { clipPath: `inset(0 ${100 - wipePosition}% 0 0)` } : undefined}
+            >
+              <button
+                onClick={(e) => { e.stopPropagation(); setAudioSource('compare'); }}
+                className={cn(
+                  "absolute top-2 left-2 z-10 flex items-center gap-1.5 text-xs font-medium px-2.5 py-1 rounded-md transition-all",
+                  audioSource === 'compare'
+                    ? "bg-accent text-white shadow-md shadow-accent/40"
+                    : "bg-black/70 text-white/40 border border-white/10 hover:text-white/70 hover:border-white/25",
+                )}
+                title="Play audio from this version"
+              >
+                {compareVersionNumber != null ? `v${compareVersionNumber}` : 'B'}
+                <Volume2 className="h-3 w-3" />
+              </button>
               <video
                 ref={compare.videoRef}
                 className="absolute inset-0 w-full h-full object-contain"
+                style={{ opacity: compareMode === 'overlay' ? overlayOpacity / 100 : 1 }}
                 playsInline
                 preload="metadata"
               />
@@ -474,6 +549,14 @@ export function VideoPlayer({
               )}
             </div>
           )}
+
+          {/* Wipe divider line */}
+          {compareVersionId && compareMode === 'wipe' && (
+            <div
+              className="absolute top-0 bottom-0 w-px bg-white/60 z-20 pointer-events-none"
+              style={{ left: `${wipePosition}%` }}
+            />
+          )}
         </div>
       </div>
 
@@ -483,7 +566,7 @@ export function VideoPlayer({
           currentTime={currentTime}
           duration={duration}
           buffered={buffered}
-          comments={comments}
+          comments={audioSource === 'compare' ? compareComments : comments}
           streamUrl={streamUrl}
           onSeek={seek}
         />
@@ -598,8 +681,92 @@ export function VideoPlayer({
           )}
         </div>
 
-        {/* Right: Quality, Fullscreen */}
+        {/* Right: Compare mode, Quality, Fullscreen */}
         <div className="flex items-center gap-2">
+          {compareVersionId && (
+            <div className="flex items-center rounded border border-border overflow-hidden">
+              <button
+                onClick={() => setCompareMode('columns')}
+                className={cn(
+                  "flex h-7 w-7 items-center justify-center transition-colors",
+                  compareMode === 'columns'
+                    ? "bg-accent/15 text-accent"
+                    : "text-text-tertiary hover:text-text-secondary hover:bg-bg-hover",
+                )}
+                title="Side by side"
+              >
+                <Columns2 className="h-3.5 w-3.5" />
+              </button>
+              <button
+                onClick={() => setCompareMode('rows')}
+                className={cn(
+                  "flex h-7 w-7 items-center justify-center transition-colors border-l border-border",
+                  compareMode === 'rows'
+                    ? "bg-accent/15 text-accent"
+                    : "text-text-tertiary hover:text-text-secondary hover:bg-bg-hover",
+                )}
+                title="Stacked"
+              >
+                <Rows2 className="h-3.5 w-3.5" />
+              </button>
+              <button
+                onClick={() => setCompareMode('wipe')}
+                className={cn(
+                  "flex h-7 w-7 items-center justify-center transition-colors border-l border-border",
+                  compareMode === 'wipe'
+                    ? "bg-accent/15 text-accent"
+                    : "text-text-tertiary hover:text-text-secondary hover:bg-bg-hover",
+                )}
+                title="Wipe"
+              >
+                <FlipHorizontal2 className="h-3.5 w-3.5" />
+              </button>
+              <button
+                onClick={() => setCompareMode('overlay')}
+                className={cn(
+                  "flex h-7 w-7 items-center justify-center transition-colors border-l border-border",
+                  compareMode === 'overlay'
+                    ? "bg-accent/15 text-accent"
+                    : "text-text-tertiary hover:text-text-secondary hover:bg-bg-hover",
+                )}
+                title="Overlay"
+              >
+                <Layers className="h-3.5 w-3.5" />
+              </button>
+            </div>
+          )}
+          {compareVersionId && compareMode === 'wipe' && (
+            <div className="flex items-center gap-1.5">
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={wipePosition}
+                onChange={(e) => setWipePosition(Number(e.target.value))}
+                className="w-20 accent-accent cursor-pointer"
+                title="Wipe position"
+              />
+              <span className="text-xs text-text-tertiary tabular-nums w-7 text-right">
+                {wipePosition}%
+              </span>
+            </div>
+          )}
+          {compareVersionId && compareMode === 'overlay' && (
+            <div className="flex items-center gap-1.5">
+              <input
+                type="range"
+                min={0}
+                max={100}
+                value={overlayOpacity}
+                onChange={(e) => setOverlayOpacity(Number(e.target.value))}
+                className="w-20 accent-accent cursor-pointer"
+                title="Overlay opacity"
+              />
+              <span className="text-xs text-text-tertiary tabular-nums w-7 text-right">
+                {overlayOpacity}%
+              </span>
+            </div>
+          )}
           {qualityLevels.length > 0 && (
             <select
               value={currentQuality}
