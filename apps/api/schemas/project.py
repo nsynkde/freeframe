@@ -12,6 +12,7 @@ class ProjectUpdate(BaseModel):
     name: str | None = None
     description: str | None = None
     is_public: bool | None = None
+    slack_webhook_url: str | None = None
 
 class ProjectResponse(BaseModel):
     id: uuid.UUID
@@ -22,6 +23,7 @@ class ProjectResponse(BaseModel):
     created_at: datetime
     poster_url: str | None = None
     is_public: bool = False
+    slack_webhook_url: str | None = None
     asset_count: int = 0
     storage_bytes: int = 0
     member_count: int = 0

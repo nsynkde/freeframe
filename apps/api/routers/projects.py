@@ -155,6 +155,8 @@ def update_project(project_id: uuid.UUID, body: ProjectUpdate, db: Session = Dep
         project.description = body.description
     if body.is_public is not None:
         project.is_public = body.is_public
+    if body.slack_webhook_url is not None:
+        project.slack_webhook_url = body.slack_webhook_url or None
     db.commit()
     db.refresh(project)
     resp = ProjectResponse.model_validate(project)

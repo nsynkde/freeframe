@@ -55,8 +55,8 @@ interface ShareValidateResponse {
 interface GuestComment {
   id: string
   body: string
-  guest_name: string
-  guest_email: string
+  author?: { name: string; avatar_url?: string | null } | null
+  guest_author?: { name: string; email: string } | null
   created_at: string
   timecode_start?: number | null
 }
@@ -66,6 +66,7 @@ type CommentsResponse = GuestComment[]
 // ─── Utility ──────────────────────────────────────────────────────────────────
 
 const API_URL = process.env.NEXT_PUBLIC_API_URL || 'http://localhost:8000'
+const resolveUrl = (url: string) => url.startsWith('/') ? `${API_URL}${url}` : url
 
 async function fetchShareInfo(
   token: string,
@@ -235,9 +236,9 @@ function GuestCommentList({ token, refreshKey }: GuestCommentListProps) {
         >
           <div className="flex items-center gap-2 mb-1.5">
             <div className="flex h-6 w-6 shrink-0 items-center justify-center rounded-full bg-purple-500/20 text-2xs font-medium text-purple-400">
-              {comment.guest_name.charAt(0).toUpperCase()}
+              {(comment.guest_author?.name ?? comment.author?.name)?.charAt(0).toUpperCase()}
             </div>
-            <span className="text-xs font-medium text-zinc-200">{comment.guest_name}</span>
+            <span className="text-xs font-medium text-zinc-200">{comment.guest_author?.name ?? comment.author?.name}</span>
             {comment.timecode_start != null && (
               <span className="text-2xs text-zinc-500 font-mono bg-white/5 px-1.5 py-0.5 rounded">
                 {Math.floor(comment.timecode_start / 60)}:
@@ -701,7 +702,7 @@ function ShareViewer({
   shareName,
   onBack,
 }: ShareViewerProps) {
-  const [streamUrl, setStreamUrl] = React.useState<string | null>(asset.stream_url ?? null)
+  const [streamUrl, setStreamUrl] = React.useState<string | null>(asset.stream_url ? resolveUrl(asset.stream_url) : null)
   const [streamLoading, setStreamLoading] = React.useState(false)
   const [commentKey, setCommentKey] = React.useState(0)
   const [sidebarOpen, setSidebarOpen] = React.useState(true)
@@ -709,7 +710,7 @@ function ShareViewer({
   // For video/audio assets, get a stream URL if not already provided
   React.useEffect(() => {
     if (asset.stream_url) {
-      setStreamUrl(asset.stream_url)
+      setStreamUrl(resolveUrl(asset.stream_url))
       return
     }
     if (asset.asset_type !== 'video' && asset.asset_type !== 'audio') return
@@ -717,8 +718,8 @@ function ShareViewer({
     fetch(`${API_URL}/share/${token}/stream/${asset.id}`)
       .then((r) => (r.ok ? r.json() : null))
       .then((data) => {
-        if (data?.stream_url) setStreamUrl(data.stream_url)
-        else if (data?.url) setStreamUrl(data.url)
+        const raw = data?.url ?? data?.stream_url
+        if (raw) setStreamUrl(resolveUrl(raw))
       })
       .catch(() => null)
       .finally(() => setStreamLoading(false))
@@ -827,7 +828,7 @@ function FolderAssetViewer({
 
     Promise.all([streamPromise, thumbPromise]).then(([streamData, thumbData]) => {
       if (cancelled) return
-      if (streamData?.url) setStreamUrl(streamData.url)
+      if (streamData?.url) setStreamUrl(resolveUrl(streamData.url))
       if (streamData?.name)
         setAssetInfo({
           name: streamData.name,

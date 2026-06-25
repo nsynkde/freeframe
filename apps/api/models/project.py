@@ -29,6 +29,7 @@ class Project(Base):
     created_by: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), ForeignKey("users.id"), nullable=False)
     poster_s3_key: Mapped[Optional[str]] = mapped_column(String(1024), nullable=True)
     is_public: Mapped[bool] = mapped_column(Boolean, default=False, server_default="false")
+    slack_webhook_url: Mapped[Optional[str]] = mapped_column(String(2048), nullable=True)
     created_at: Mapped[datetime] = mapped_column(DateTime(timezone=True), server_default=func.now())
     deleted_at: Mapped[Optional[datetime]] = mapped_column(DateTime(timezone=True), nullable=True)
 

@@ -36,7 +36,9 @@ from ..schemas.share import (
 )
 from ..services.permissions import require_project_role, validate_share_link, validate_share_link_with_session
 from ..services.redis_service import create_share_session
-from ..services.s3_service import generate_presigned_get_url, build_download_filename
+from ..services.s3_service import generate_presigned_get_url, build_download_filename, get_s3_client
+from ..config import settings
+from fastapi.responses import StreamingResponse
 from ..services.crypto_service import encrypt_password, decrypt_password
 from .hls_proxy import create_hls_token
 from ..models.project import Project, ProjectRole
@@ -363,6 +365,49 @@ def _share_link_response(link: ShareLink) -> ShareLinkResponse:
         except Exception:
             response.password_value = None
     return response
+
+
+# ── Figma widget public endpoints ────────────────────────────────────────────
+
+@router.get("/assets/{asset_id}/info")
+def get_asset_info(asset_id: uuid.UUID, db: Session = Depends(get_db)):
+    asset = db.query(Asset).filter(Asset.id == asset_id, Asset.deleted_at.is_(None)).first()
+    if not asset:
+        raise HTTPException(status_code=404, detail="Asset not found")
+    version = db.query(AssetVersion).filter(
+        AssetVersion.asset_id == asset_id,
+        AssetVersion.deleted_at.is_(None),
+    ).order_by(AssetVersion.version_number.desc()).first()
+    return {
+        "name": asset.name,
+        "version": version.version_number if version else 1,
+        "uploaded_at": (version.created_at if version else asset.created_at).isoformat(),
+    }
+
+
+@router.get("/assets/{asset_id}/thumbnail")
+def get_asset_thumbnail(asset_id: uuid.UUID, db: Session = Depends(get_db)):
+    media_file = _get_latest_media_file(db, asset_id)
+    if not media_file or not media_file.s3_key_thumbnail:
+        raise HTTPException(status_code=404, detail="No thumbnail available")
+    s3 = get_s3_client()
+    obj = s3.get_object(Bucket=settings.s3_bucket, Key=media_file.s3_key_thumbnail)
+    return StreamingResponse(obj["Body"], media_type="image/jpeg")
+
+
+@router.get("/share/{token}/thumbnail")
+def get_share_thumbnail(token: str, db: Session = Depends(get_db)):
+    link = db.query(ShareLink).filter(
+        ShareLink.token == token, ShareLink.deleted_at.is_(None)
+    ).first()
+    if not link or not link.asset_id:
+        raise HTTPException(status_code=404, detail="Share not found")
+    media_file = _get_latest_media_file(db, link.asset_id)
+    if not media_file or not media_file.s3_key_thumbnail:
+        raise HTTPException(status_code=404, detail="No thumbnail available")
+    s3 = get_s3_client()
+    obj = s3.get_object(Bucket=settings.s3_bucket, Key=media_file.s3_key_thumbnail)
+    return StreamingResponse(obj["Body"], media_type="image/jpeg")
 
 
 # ── Authenticated share link details (for settings panel) ────────────────────

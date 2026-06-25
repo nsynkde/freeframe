@@ -3,7 +3,7 @@
 import * as React from 'react'
 import * as Dialog from '@radix-ui/react-dialog'
 import * as Switch from '@radix-ui/react-switch'
-import { X, ImagePlus, Globe, Lock } from 'lucide-react'
+import { X, ImagePlus, Globe, Lock, Hash } from 'lucide-react'
 import { cn } from '@/lib/utils'
 import { getGradientForProject } from '@/lib/gradient-utils'
 import { api } from '@/lib/api'
@@ -26,6 +26,7 @@ export function ProjectSettingsDialog({
   const [name, setName] = React.useState(project.name)
   const [description, setDescription] = React.useState(project.description || '')
   const [isPublic, setIsPublic] = React.useState(project.is_public ?? false)
+  const [slackWebhook, setSlackWebhook] = React.useState(project.slack_webhook_url ?? '')
   const [posterPreview, setPosterPreview] = React.useState<string | null>(project.poster_url ?? null)
   const [posterFile, setPosterFile] = React.useState<File | null>(null)
   const [saving, setSaving] = React.useState(false)
@@ -36,6 +37,7 @@ export function ProjectSettingsDialog({
     setName(project.name)
     setDescription(project.description || '')
     setIsPublic(project.is_public ?? false)
+    setSlackWebhook(project.slack_webhook_url ?? '')
     setPosterPreview(project.poster_url ?? null)
     setPosterFile(null)
   }, [project])
@@ -62,6 +64,7 @@ export function ProjectSettingsDialog({
         name: name.trim(),
         description: description.trim() || null,
         is_public: isPublic,
+        slack_webhook_url: slackWebhook.trim() || null,
       })
 
       onUpdated()
@@ -146,6 +149,23 @@ export function ProjectSettingsDialog({
                     placeholder="Optional project description..."
                     className="w-full rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary resize-none focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent transition-colors"
                   />
+                </div>
+
+                {/* Slack webhook */}
+                <div className="space-y-1.5">
+                  <label className="text-xs font-medium text-text-tertiary uppercase tracking-wider flex items-center gap-1.5">
+                    <Hash className="h-3 w-3" /> Slack Notifications
+                  </label>
+                  <input
+                    type="url"
+                    value={slackWebhook}
+                    onChange={(e) => setSlackWebhook(e.target.value)}
+                    placeholder="https://hooks.slack.com/services/…"
+                    className="w-full rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-sm text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent focus:ring-1 focus:ring-accent transition-colors font-mono"
+                  />
+                  <p className="text-xs text-text-tertiary">
+                    Incoming webhook URL — notifies on new versions and comments.
+                  </p>
                 </div>
 
                 {/* Public / Private toggle */}

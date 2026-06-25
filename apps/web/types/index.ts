@@ -91,6 +91,7 @@ export interface Project {
   storage_bytes?: number;
   member_count?: number;
   role?: string | null;
+  slack_webhook_url?: string | null;
 }
 
 export interface ProjectMember {

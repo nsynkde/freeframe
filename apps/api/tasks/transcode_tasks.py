@@ -68,6 +68,11 @@ def process_asset(self, asset_id: str, version_id: str):
                 "asset_id": asset_id,
                 "version_id": version_id,
             })
+            try:
+                from .slack_tasks import notify_slack
+                notify_slack.delay(str(asset.project_id), "transcode_complete", {"asset_id": asset_id, "version_id": version_id})
+            except Exception:
+                pass  # best-effort — never fail the task over a notification
 
         except Exception as exc:
             version.processing_status = ProcessingStatus.failed

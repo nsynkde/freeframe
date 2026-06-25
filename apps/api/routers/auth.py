@@ -1,7 +1,13 @@
 from fastapi import APIRouter, Depends, HTTPException, status
+from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
+from urllib.parse import urlencode
 import uuid
 import secrets
+import time
+import hmac
+import hashlib
+import httpx
 from datetime import datetime, timedelta, timezone
 from ..database import get_db
 from ..schemas.auth import (
@@ -25,8 +31,31 @@ from ..tasks.celery_app import send_task_safe
 from ..models.user import User, UserStatus
 from ..middleware.auth import get_current_user
 from ..middleware.rate_limit import rate_limit
+from ..config import settings
 
 router = APIRouter(prefix="/auth", tags=["auth"])
+
+_GOOGLE_AUTH_URL = "https://accounts.google.com/o/oauth2/v2/auth"
+_GOOGLE_TOKEN_URL = "https://oauth2.googleapis.com/token"
+_GOOGLE_USERINFO_URL = "https://www.googleapis.com/oauth2/v3/userinfo"
+
+
+def _make_oauth_state() -> str:
+    nonce = secrets.token_hex(16)
+    exp = str(int(time.time()) + 300)
+    msg = f"{nonce}|{exp}"
+    sig = hmac.new(settings.jwt_secret.encode(), msg.encode(), hashlib.sha256).hexdigest()[:16]
+    return f"{nonce}|{exp}|{sig}"
+
+
+def _verify_oauth_state(state: str) -> bool:
+    try:
+        nonce, exp, sig = state.split("|")
+        msg = f"{nonce}|{exp}"
+        expected = hmac.new(settings.jwt_secret.encode(), msg.encode(), hashlib.sha256).hexdigest()[:16]
+        return hmac.compare_digest(sig, expected) and int(exp) > int(time.time())
+    except Exception:
+        return False
 
 MAGIC_CODE_EXPIRY_MINUTES = MAGIC_CODE_EXPIRY_SECONDS // 60
 
@@ -231,6 +260,98 @@ def refresh_token(body: RefreshRequest, db: Session = Depends(get_db)):
 @router.get("/me", response_model=UserResponse)
 def get_me(current_user: User = Depends(get_current_user)):
     return current_user
+
+
+@router.get("/google")
+def google_login():
+    if not settings.google_client_id:
+        raise HTTPException(status_code=503, detail="Google login not configured")
+    params: dict = {
+        "client_id": settings.google_client_id,
+        "redirect_uri": f"{settings.api_url}/auth/google/callback",
+        "response_type": "code",
+        "scope": "openid email profile",
+        "state": _make_oauth_state(),
+    }
+    if settings.google_allowed_domain:
+        params["hd"] = settings.google_allowed_domain
+    return RedirectResponse(f"{_GOOGLE_AUTH_URL}?{urlencode(params)}")
+
+
+@router.get("/google/callback")
+def google_callback(
+    db: Session = Depends(get_db),
+    code: str | None = None,
+    state: str | None = None,
+    error: str | None = None,
+):
+    frontend = settings.frontend_url.rstrip("/")
+    if error or not code or not state:
+        return RedirectResponse(f"{frontend}/login?error=oauth_cancelled")
+    if not _verify_oauth_state(state):
+        return RedirectResponse(f"{frontend}/login?error=invalid_state")
+
+    redirect_uri = f"{settings.api_url}/auth/google/callback"
+    with httpx.Client() as client:
+        token_resp = client.post(_GOOGLE_TOKEN_URL, data={
+            "code": code,
+            "client_id": settings.google_client_id,
+            "client_secret": settings.google_client_secret,
+            "redirect_uri": redirect_uri,
+            "grant_type": "authorization_code",
+        })
+        if not token_resp.is_success:
+            return RedirectResponse(f"{frontend}/login?error=oauth_failed")
+
+        info_resp = client.get(_GOOGLE_USERINFO_URL, headers={
+            "Authorization": f"Bearer {token_resp.json()['access_token']}"
+        })
+        if not info_resp.is_success:
+            return RedirectResponse(f"{frontend}/login?error=oauth_failed")
+
+    info = info_resp.json()
+    email: str = info["email"]
+    google_id: str = info["sub"]
+    name: str = info.get("name") or email.split("@")[0]
+    avatar_url: str | None = info.get("picture")
+
+    if settings.google_allowed_domain and not email.endswith(f"@{settings.google_allowed_domain}"):
+        return RedirectResponse(f"{frontend}/login?error=domain_not_allowed")
+
+    from sqlalchemy import or_
+    user = db.query(User).filter(
+        or_(User.google_id == google_id, User.email == email),
+        User.deleted_at.is_(None),
+    ).first()
+
+    if not user:
+        user_count = db.query(User).filter(User.deleted_at.is_(None)).count()
+        user = User(
+            email=email,
+            name=name,
+            google_id=google_id,
+            avatar_url=avatar_url,
+            status=UserStatus.active,
+            email_verified=True,
+            is_superadmin=user_count == 0,
+        )
+        db.add(user)
+    else:
+        if user.status == UserStatus.deactivated:
+            return RedirectResponse(f"{frontend}/login?error=account_deactivated")
+        if not user.google_id:
+            user.google_id = google_id
+        if avatar_url and not user.avatar_url:
+            user.avatar_url = avatar_url
+        user.email_verified = True
+
+    db.commit()
+
+    fragment = urlencode({
+        "access_token": create_access_token(str(user.id)),
+        "refresh_token": create_refresh_token(str(user.id)),
+    })
+    return RedirectResponse(f"{frontend}/auth/oauth-callback#{fragment}")
 
 
 @router.patch("/me/preferences", response_model=UserResponse)

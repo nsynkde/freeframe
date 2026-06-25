@@ -38,6 +38,13 @@ class Settings(BaseSettings):
     access_token_expire_minutes: int = 15
     refresh_token_expire_days: int = 7
     frontend_url: str = "http://localhost:3000"
+    api_url: str = "http://localhost:8000"
+    cors_extra_origins: list[str] = []
+
+    # Google OAuth
+    google_client_id: str | None = None
+    google_client_secret: str | None = None
+    google_allowed_domain: str | None = None  # e.g. "nsynk.de" — restricts to company accounts
     transcoder_engine: str = "ffmpeg"
     
     # Worker concurrency settings

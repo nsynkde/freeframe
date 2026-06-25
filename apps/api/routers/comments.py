@@ -265,6 +265,15 @@ def create_comment(
 
     db.commit()
     db.refresh(comment)
+
+    from ..tasks.slack_tasks import notify_slack
+    notify_slack.delay(str(asset.project_id), "comment", {
+        "asset_id": str(asset.id),
+        "asset_name": asset.name,
+        "author": current_user.name,
+        "body": body.body[:200],
+    })
+
     return _build_comment_response(comment, db, current_user_id=current_user.id)
 
 

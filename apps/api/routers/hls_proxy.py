@@ -13,7 +13,7 @@ from datetime import datetime, timedelta, timezone
 
 from jose import jwt, JWTError
 from fastapi import APIRouter, HTTPException, Query
-from fastapi.responses import Response
+from fastapi.responses import Response, StreamingResponse
 
 from ..config import settings
 from ..services.s3_service import generate_presigned_get_url, get_s3_client
@@ -69,13 +69,12 @@ def _rewrite_manifest(content: str, s3_prefix: str, manifest_path: str, token: s
             relative_key = stripped
 
         if stripped.endswith(".m3u8"):
-            # Variant playlist -> proxy URL with token
-            result.append(f"{relative_key}?token={token}")
+            # Variant playlist -> root-relative proxy URL
+            result.append(f"/stream/hls/{relative_key}?token={token}")
         elif stripped.endswith(".ts"):
-            # Segment -> presigned S3 URL (direct to S3, 24-hour expiry to
-            # match the outer token lifetime so pause-and-resume works)
-            s3_key = f"{s3_prefix}/{relative_key}"
-            result.append(generate_presigned_get_url(s3_key, expires_in=86400))
+            # Root-relative so hls.js doesn't resolve it against the variant
+            # playlist's subdirectory (which would double-prefix the path).
+            result.append(f"/stream/hls/{relative_key}?token={token}")
         else:
             result.append(line)
 
@@ -84,38 +83,47 @@ def _rewrite_manifest(content: str, s3_prefix: str, manifest_path: str, token: s
 
 @router.get("/hls/{path:path}")
 def hls_proxy(path: str, token: str = Query(...)):
-    """Proxy HLS manifests with URL rewriting for secure streaming."""
+    """Proxy HLS manifests and segments — keeps all video traffic on the same origin."""
     s3_prefix = _verify_hls_token(token)
 
-    # Only proxy m3u8 manifests
-    if not path.endswith(".m3u8"):
-        raise HTTPException(status_code=400, detail="Only .m3u8 files are proxied")
+    if not (path.endswith(".m3u8") or path.endswith(".ts")):
+        raise HTTPException(status_code=400, detail="Only .m3u8 and .ts files are proxied")
 
     # Prevent directory traversal
     normalised = posixpath.normpath(path)
     if normalised.startswith("..") or normalised.startswith("/"):
         raise HTTPException(status_code=400, detail="Invalid path")
 
-    # Defense-in-depth: verify resolved key stays within the token's prefix
     s3_key = f"{s3_prefix}/{normalised}"
     if not s3_key.startswith(s3_prefix + "/"):
         raise HTTPException(status_code=400, detail="Invalid path")
 
-    # Fetch manifest from S3
     s3 = get_s3_client()
+
+    if path.endswith(".m3u8"):
+        try:
+            obj = s3.get_object(Bucket=settings.s3_bucket, Key=s3_key)
+            content = obj["Body"].read().decode("utf-8")
+        except Exception as e:
+            logger.error("Failed to fetch HLS manifest %s: %s", s3_key, e)
+            raise HTTPException(status_code=404, detail="Manifest not found")
+
+        rewritten = _rewrite_manifest(content, s3_prefix, normalised, token)
+        return Response(
+            content=rewritten,
+            media_type="application/vnd.apple.mpegurl",
+            headers={"Cache-Control": "no-cache"},
+        )
+
+    # .ts segment — stream directly from S3
     try:
         obj = s3.get_object(Bucket=settings.s3_bucket, Key=s3_key)
-        content = obj["Body"].read().decode("utf-8")
-    except s3.exceptions.NoSuchKey:
-        raise HTTPException(status_code=404, detail="Manifest not found")
     except Exception as e:
-        logger.error("Failed to fetch HLS manifest %s: %s", s3_key, e)
-        raise HTTPException(status_code=404, detail="Manifest not found")
+        logger.error("Failed to fetch HLS segment %s: %s", s3_key, e)
+        raise HTTPException(status_code=404, detail="Segment not found")
 
-    rewritten = _rewrite_manifest(content, s3_prefix, normalised, token)
-
-    return Response(
-        content=rewritten,
-        media_type="application/vnd.apple.mpegurl",
-        headers={"Cache-Control": "no-cache"},
+    return StreamingResponse(
+        obj["Body"],
+        media_type="video/mp2t",
+        headers={"Cache-Control": "max-age=86400"},
     )
