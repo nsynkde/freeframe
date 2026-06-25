@@ -1,0 +1,12 @@
+{
+  "name": "Freeframe",
+  "id": "com.nsynk.freeframe",
+  "api": "1.0.0",
+  "main": "dist/plugin.js",
+  "ui": "src/ui.html",
+  "editorType": ["figma", "figjam"],
+  "networkAccess": {
+    "allowedDomains": ["*"],
+    "reasoning": "Connects to a self-hosted Freeframe instance at a user-configured API URL"
+  }
+}

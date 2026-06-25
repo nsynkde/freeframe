@@ -1,0 +1,14 @@
+{
+  "name": "@freeframe/figma-plugin",
+  "version": "0.1.0",
+  "private": true,
+  "scripts": {
+    "build": "esbuild src/plugin.ts --bundle --outfile=dist/plugin.js --platform=browser --target=es2017",
+    "dev": "esbuild src/plugin.ts --bundle --outfile=dist/plugin.js --platform=browser --target=es2017 --watch"
+  },
+  "devDependencies": {
+    "@figma/plugin-typings": "^1.96.0",
+    "esbuild": "^0.21.0",
+    "typescript": "^5.4.0"
+  }
+}

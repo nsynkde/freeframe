@@ -1,0 +1,658 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<title>Freeframe</title>
+<style>
+  *, *::before, *::after { box-sizing: border-box; margin: 0; padding: 0; }
+
+  :root {
+    --bg: #111;
+    --surface: #1a1a1a;
+    --border: #2a2a2a;
+    --text: #f0f0f0;
+    --muted: #888;
+    --accent: #6b5ce7;
+    --accent-hover: #7d6ef0;
+    --danger: #e74c3c;
+    --radius: 6px;
+    --font: -apple-system, BlinkMacSystemFont, 'Segoe UI', sans-serif;
+  }
+
+  body {
+    background: var(--bg);
+    color: var(--text);
+    font-family: var(--font);
+    font-size: 13px;
+    height: 100vh;
+    display: flex;
+    flex-direction: column;
+    overflow: hidden;
+  }
+
+  /* ── layout ── */
+  #app { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+
+  .screen { flex: 1; display: flex; flex-direction: column; overflow: hidden; }
+  .screen.hidden { display: none; }
+
+  .header {
+    display: flex;
+    align-items: center;
+    gap: 8px;
+    padding: 12px 14px;
+    border-bottom: 1px solid var(--border);
+    flex-shrink: 0;
+  }
+  .header h1 { font-size: 13px; font-weight: 600; flex: 1; }
+  .header .back-btn {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    padding: 2px 4px;
+    font-size: 16px;
+    line-height: 1;
+    border-radius: 3px;
+  }
+  .header .back-btn:hover { color: var(--text); background: var(--border); }
+
+  .scroll { flex: 1; overflow-y: auto; padding: 10px; }
+  .scroll::-webkit-scrollbar { width: 4px; }
+  .scroll::-webkit-scrollbar-thumb { background: var(--border); border-radius: 2px; }
+
+  /* ── setup screen ── */
+  .setup-body { padding: 20px 16px; display: flex; flex-direction: column; gap: 16px; flex: 1; overflow-y: auto; }
+  .setup-footer { padding: 12px 16px; border-top: 1px solid var(--border); flex-shrink: 0; }
+  .logo { font-size: 18px; font-weight: 700; letter-spacing: -0.5px; }
+  .logo span { color: var(--accent); }
+  .field { display: flex; flex-direction: column; gap: 6px; }
+  .field label { font-size: 11px; font-weight: 500; color: var(--muted); text-transform: uppercase; letter-spacing: 0.5px; }
+  .field input {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: var(--radius);
+    color: var(--text);
+    font-size: 13px;
+    padding: 8px 10px;
+    outline: none;
+    width: 100%;
+    font-family: var(--font);
+  }
+  .field input:focus { border-color: var(--accent); }
+  .field .hint { font-size: 11px; color: var(--muted); line-height: 1.4; }
+  .field .hint code {
+    background: var(--surface);
+    border: 1px solid var(--border);
+    border-radius: 3px;
+    padding: 1px 4px;
+    font-family: 'SF Mono', 'Fira Code', monospace;
+    font-size: 10px;
+  }
+
+  /* ── buttons ── */
+  .btn {
+    background: var(--accent);
+    border: none;
+    border-radius: var(--radius);
+    color: #fff;
+    cursor: pointer;
+    font-size: 13px;
+    font-weight: 500;
+    padding: 9px 14px;
+    width: 100%;
+    transition: background 0.15s;
+    font-family: var(--font);
+  }
+  .btn:hover { background: var(--accent-hover); }
+  .btn:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn.ghost {
+    background: transparent;
+    border: 1px solid var(--border);
+    color: var(--muted);
+  }
+  .btn.ghost:hover { border-color: var(--text); color: var(--text); background: transparent; }
+  .btn.danger { background: transparent; border: 1px solid var(--danger); color: var(--danger); }
+  .btn.danger:hover { background: var(--danger); color: #fff; }
+
+  /* ── list items ── */
+  .list-item {
+    display: flex;
+    align-items: center;
+    gap: 10px;
+    padding: 9px 10px;
+    border-radius: var(--radius);
+    cursor: pointer;
+    border: 1px solid transparent;
+    transition: background 0.1s;
+    text-decoration: none;
+    color: var(--text);
+    margin-bottom: 3px;
+  }
+  .list-item:hover { background: var(--surface); border-color: var(--border); }
+  .list-item .icon {
+    width: 28px;
+    height: 28px;
+    border-radius: 4px;
+    background: var(--surface);
+    border: 1px solid var(--border);
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    font-size: 14px;
+    flex-shrink: 0;
+  }
+  .list-item .info { flex: 1; min-width: 0; }
+  .list-item .name { font-weight: 500; white-space: nowrap; overflow: hidden; text-overflow: ellipsis; }
+  .list-item .meta { font-size: 11px; color: var(--muted); margin-top: 1px; }
+  .list-item .arrow { color: var(--muted); font-size: 12px; }
+
+  /* ── player screen ── */
+  #player-screen { display: flex; flex-direction: column; }
+  #player-frame {
+    flex: 1;
+    border: none;
+    background: #000;
+    display: block;
+    width: 100%;
+  }
+
+  /* ── states ── */
+  .empty {
+    display: flex;
+    flex-direction: column;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    color: var(--muted);
+    padding: 40px 20px;
+    text-align: center;
+    flex: 1;
+  }
+  .empty .icon { font-size: 28px; }
+
+  .error-msg {
+    background: #2a1a1a;
+    border: 1px solid #4a2a2a;
+    border-radius: var(--radius);
+    color: #e88;
+    font-size: 12px;
+    padding: 8px 10px;
+    margin: 10px;
+  }
+
+  .spinner {
+    display: inline-block;
+    width: 14px;
+    height: 14px;
+    border: 2px solid var(--border);
+    border-top-color: var(--accent);
+    border-radius: 50%;
+    animation: spin 0.7s linear infinite;
+  }
+  @keyframes spin { to { transform: rotate(360deg); } }
+
+  .loading-row {
+    display: flex;
+    align-items: center;
+    justify-content: center;
+    gap: 8px;
+    padding: 20px;
+    color: var(--muted);
+    font-size: 12px;
+  }
+
+  /* ── sync ── */
+  .btn-icon {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 16px;
+    padding: 2px 5px;
+    border-radius: 3px;
+    line-height: 1;
+    transition: color 0.1s;
+  }
+  .btn-icon:hover { color: var(--text); background: var(--border); }
+  .btn-icon:disabled { opacity: 0.4; cursor: not-allowed; }
+  .btn-icon.spinning { animation: spin 0.7s linear infinite; display: inline-block; }
+
+  .sync-bar {
+    padding: 7px 14px;
+    font-size: 11px;
+    color: var(--muted);
+    border-bottom: 1px solid var(--border);
+    background: var(--surface);
+    flex-shrink: 0;
+  }
+  .sync-bar.error { color: #e88; background: #2a1a1a; border-color: #4a2a2a; }
+  .sync-bar.success { color: #6db86d; background: #1a2a1a; border-color: #2a4a2a; }
+  .sync-bar.hidden { display: none; }
+
+  /* ── settings strip ── */
+  .settings-strip {
+    display: flex;
+    align-items: center;
+    padding: 8px 14px;
+    border-top: 1px solid var(--border);
+    gap: 8px;
+    flex-shrink: 0;
+  }
+  .settings-strip .url-label {
+    flex: 1;
+    font-size: 11px;
+    color: var(--muted);
+    white-space: nowrap;
+    overflow: hidden;
+    text-overflow: ellipsis;
+  }
+  .settings-strip button {
+    background: none;
+    border: none;
+    color: var(--muted);
+    cursor: pointer;
+    font-size: 14px;
+    padding: 2px 4px;
+    border-radius: 3px;
+  }
+  .settings-strip button:hover { color: var(--text); background: var(--border); }
+</style>
+</head>
+<body>
+<div id="app">
+
+  <!-- ── Setup ── -->
+  <div id="setup-screen" class="screen hidden">
+    <div class="setup-body">
+      <div class="logo">free<span>frame</span></div>
+      <div class="field">
+        <label>API URL</label>
+        <input id="api-url-input" type="url" placeholder="http://localhost:8000" autocomplete="off" spellcheck="false">
+      </div>
+      <div class="field">
+        <label>Access Token</label>
+        <input id="token-input" type="password" placeholder="Paste your ff_access_token" autocomplete="off" spellcheck="false">
+        <p class="hint">DevTools → Console: <code>localStorage.getItem('ff_access_token')</code></p>
+      </div>
+      <div id="setup-error" class="error-msg hidden"></div>
+    </div>
+    <div class="setup-footer">
+      <button class="btn" id="save-btn">Connect</button>
+    </div>
+  </div>
+
+  <!-- ── Projects ── -->
+  <div id="projects-screen" class="screen hidden">
+    <div class="header">
+      <h1>Projects</h1>
+    </div>
+    <div class="scroll" id="projects-list"></div>
+    <div class="settings-strip">
+      <span class="url-label" id="api-url-label"></span>
+      <button id="logout-btn" title="Disconnect">⏏</button>
+    </div>
+  </div>
+
+  <!-- ── Assets ── -->
+  <div id="assets-screen" class="screen hidden">
+    <div class="header">
+      <button class="back-btn" id="assets-back">‹</button>
+      <h1 id="assets-title">Assets</h1>
+      <button class="btn-icon" id="sync-btn" title="Sync Board">⟳</button>
+    </div>
+    <div id="sync-bar" class="sync-bar hidden"></div>
+    <div class="scroll" id="assets-list"></div>
+  </div>
+
+  <!-- ── Player ── -->
+  <div id="player-screen" class="screen hidden">
+    <div class="header">
+      <button class="back-btn" id="player-back">‹</button>
+      <h1 id="player-title">Player</h1>
+    </div>
+    <iframe id="player-frame" allowfullscreen allow="autoplay; fullscreen"></iframe>
+  </div>
+
+</div>
+
+<script>
+  // ── state ──────────────────────────────────────────────────────────────
+  let config = null; // { apiUrl, token }
+  let currentProjectId = null;
+  let _onWidgetScan = null;
+  let _onSyncDone = null;
+
+  // ── plugin bridge ──────────────────────────────────────────────────────
+  const post = (msg) => parent.postMessage({ pluginMessage: msg }, '*');
+
+  let _reqId = 0;
+  const _pending = new Map();
+
+  window.onmessage = (e) => {
+    const msg = e.data.pluginMessage;
+    if (!msg) return;
+    if (msg.type === 'config') {
+      if (!config) {
+        config = msg.value;
+        config ? showProjects() : showSetup();
+      }
+    }
+    if (msg.type === 'config-cleared') { config = null; showSetup(); }
+    if (msg.type === 'api-response') {
+      const pending = _pending.get(msg.id);
+      if (!pending) return;
+      _pending.delete(msg.id);
+      if (msg.ok) pending.resolve(msg.data);
+      else pending.reject(new Error(msg.error || `${msg.status}`));
+    }
+    if (msg.type === 'widget-scan' && _onWidgetScan) {
+      const cb = _onWidgetScan; _onWidgetScan = null; cb(msg.widgets);
+    }
+    if (msg.type === 'sync-done' && _onSyncDone) {
+      const cb = _onSyncDone; _onSyncDone = null; cb(msg);
+    }
+  };
+
+  post({ type: 'get-config' });
+
+  // ── API helper — routed through plugin sandbox to avoid CORS ───────────
+  function api(cfg, path, opts = {}) {
+    return new Promise((resolve, reject) => {
+      const id = ++_reqId;
+      _pending.set(id, { resolve, reject });
+      post({
+        type: 'api-request',
+        id,
+        url: cfg.apiUrl + path,
+        opts: {
+          ...opts,
+          headers: {
+            'Authorization': `Bearer ${cfg.token}`,
+            'Content-Type': 'application/json',
+            ...(opts.headers || {}),
+          },
+        },
+      });
+    });
+  }
+
+  // ── screens ────────────────────────────────────────────────────────────
+  function showOnly(id) {
+    ['setup-screen', 'projects-screen', 'assets-screen', 'player-screen']
+      .forEach(s => document.getElementById(s).classList.toggle('hidden', s !== id));
+  }
+
+  // Setup
+  function showSetup() {
+    showOnly('setup-screen');
+    document.getElementById('setup-error').classList.add('hidden');
+    document.getElementById('api-url-input').value = '';
+    document.getElementById('token-input').value = '';
+  }
+
+  document.getElementById('save-btn').onclick = () => {
+    const apiUrl = document.getElementById('api-url-input').value.trim().replace(/\/$/, '');
+    const token = document.getElementById('token-input').value.trim();
+    const errEl = document.getElementById('setup-error');
+
+    if (!apiUrl || !token) {
+      errEl.textContent = 'Both fields are required.';
+      errEl.classList.remove('hidden');
+      return;
+    }
+
+    errEl.classList.add('hidden');
+    config = { apiUrl, token };
+    post({ type: 'set-config', value: config }); // fire-and-forget persistence
+    showProjects();
+  };
+
+  // Projects
+  async function showProjects() {
+    const cfg = config;
+    if (!cfg) { showSetup(); return; }
+    showOnly('projects-screen');
+    document.getElementById('api-url-label').textContent = cfg.apiUrl.replace(/^https?:\/\//, '');
+    const list = document.getElementById('projects-list');
+    list.innerHTML = '<div class="loading-row"><span class="spinner"></span> Loading…</div>';
+
+    try {
+      const data = await api(cfg, '/projects');
+      const projects = data.items ?? data;
+
+      if (!projects.length) {
+        list.innerHTML = '<div class="empty"><div class="icon">📂</div><div>No projects found</div></div>';
+        return;
+      }
+
+      list.innerHTML = projects.map(p => `
+        <div class="list-item" data-id="${p.id}" data-name="${escHtml(p.name)}">
+          <div class="icon">📁</div>
+          <div class="info">
+            <div class="name">${escHtml(p.name)}</div>
+          </div>
+          <div class="arrow">›</div>
+        </div>
+      `).join('');
+
+      list.querySelectorAll('.list-item').forEach(el => {
+        el.onclick = () => showAssets(el.dataset.id, el.dataset.name);
+      });
+    } catch (err) {
+      list.innerHTML = `<div class="error-msg">${escHtml(err.message)}</div>`;
+    }
+  }
+
+  document.getElementById('logout-btn').onclick = () => post({ type: 'clear-config' });
+
+  // Assets
+  async function showAssets(projectId, projectName) {
+    const cfg = config;
+    if (!cfg) { showSetup(); return; }
+    currentProjectId = projectId;
+    showOnly('assets-screen');
+    document.getElementById('assets-title').textContent = projectName;
+    const list = document.getElementById('assets-list');
+    list.innerHTML = '<div class="loading-row"><span class="spinner"></span> Loading…</div>';
+
+    try {
+      const data = await api(cfg, `/projects/${projectId}/assets`);
+      const assets = data.items ?? data;
+
+      if (!assets.length) {
+        list.innerHTML = '<div class="empty"><div class="icon">🎬</div><div>No assets in this project</div></div>';
+        return;
+      }
+
+      list.innerHTML = assets.map(a => `
+        <div class="list-item" data-id="${a.id}" data-name="${escHtml(a.name)}">
+          <div class="icon">${assetIcon(a.type)}</div>
+          <div class="info">
+            <div class="name">${escHtml(a.name)}</div>
+            <div class="meta">${escHtml(a.type ?? '')}</div>
+          </div>
+          <div class="arrow">›</div>
+        </div>
+      `).join('');
+
+      list.querySelectorAll('.list-item').forEach(el => {
+        el.onclick = () => openAsset(el.dataset.id, el.dataset.name);
+      });
+    } catch (err) {
+      list.innerHTML = `<div class="error-msg">${escHtml(err.message)}</div>`;
+    }
+  }
+
+  document.getElementById('assets-back').onclick = showProjects;
+
+  // Player
+  async function openAsset(assetId, assetName) {
+    const cfg = config;
+    if (!cfg) { showSetup(); return; }
+    showOnly('player-screen');
+    document.getElementById('player-title').textContent = assetName;
+    const frame = document.getElementById('player-frame');
+    frame.src = 'about:blank';
+
+    try {
+      const shares = await api(cfg, `/assets/${assetId}/shares`);
+      const existing = (shares.items ?? shares)[0];
+      const token = existing
+        ? existing.token
+        : (await api(cfg, `/assets/${assetId}/share`, { method: 'POST', body: JSON.stringify({}) })).token;
+
+      const appUrl = cfg.apiUrl.replace(/\/api$/, '').replace(/:8000$/, ':3000');
+      frame.src = `${appUrl}/share/${token}`;
+    } catch (err) {
+      showOnly('assets-screen'); // fall back
+      document.getElementById('assets-list').innerHTML = `<div class="error-msg">${escHtml(err.message)}</div>`;
+    }
+  }
+
+  document.getElementById('player-back').onclick = () => showAssets(currentProjectId, document.getElementById('assets-title').textContent);
+
+  // ── board sync ─────────────────────────────────────────────────────────
+  document.getElementById('sync-btn').onclick = () => syncBoard();
+
+  async function syncBoard() {
+    const cfg = config;
+    if (!cfg || !currentProjectId) return;
+
+    const syncBar = document.getElementById('sync-bar');
+    const syncBtn = document.getElementById('sync-btn');
+    syncBtn.disabled = true;
+    syncBtn.classList.add('spinning');
+
+    function setStatus(text, cls) {
+      syncBar.textContent = text;
+      syncBar.className = 'sync-bar' + (cls ? ' ' + cls : '');
+    }
+
+    try {
+      setStatus('Fetching assets…');
+
+      const data = await api(cfg, `/projects/${currentProjectId}/assets`);
+      const assets = (data.items ?? data).filter(a => a.id);
+
+      setStatus('Scanning board…');
+      const widgets = await new Promise(resolve => { _onWidgetScan = resolve; post({ type: 'scan-widgets' }); });
+      console.log(`[freeframe] board scan: ${widgets.length} Freeframe widget(s) found`);
+      widgets.forEach(w => {
+        console.log(`  widget nodeId=${w.nodeId} assetUrl=${w.assetUrl || '(empty)'}`);
+        console.log(`    syncedState:`, w.syncedState);
+      });;
+
+      // Map existing widgets by assetId — only for assets that exist in this project
+      const assetIds = new Set(assets.map(a => a.id));
+      const widgetByAsset = new Map();
+      for (const w of widgets) {
+        const id = extractAssetId(w.assetUrl);
+        if (id && assetIds.has(id)) {
+          widgetByAsset.set(id, w.nodeId);
+          console.log(`  matched widget ${w.nodeId} → asset ${id}`);
+        } else if (id) {
+          console.log(`  skipped widget ${w.nodeId} — asset ${id} not in project`);
+        } else {
+          console.log(`  skipped widget ${w.nodeId} — no asset URL`);
+        }
+      }
+
+      setStatus(`Fetching data for ${assets.length} asset${assets.length !== 1 ? 's' : ''}…`);
+      console.log(`[freeframe] ${assets.length} project asset(s):`, assets.map(a => `${a.id} (${a.name})`));
+
+      // Derive app URL from API URL (same heuristic used for player)
+      const appUrl = cfg.apiUrl.replace(/\/api$/, '').replace(/:8000$/, ':3000');
+
+      const updates = [], creates = [];
+
+      await Promise.all(assets.map(async (asset) => {
+        const [info, thumbnail] = await Promise.all([
+          api(cfg, `/assets/${asset.id}`).catch((e) => { console.log(`  [info] ${asset.id} failed:`, e.message); return null; }),
+          fetchThumbnail(cfg, asset.thumbnail_url ?? null),
+        ]);
+
+        const state = {
+          assetUrl: `${appUrl}/projects/${currentProjectId}/assets/${asset.id}`,
+          assetName: info?.name ?? asset.name ?? '',
+          thumbnailBase64: thumbnail ?? '',
+          cardWidth: 280,
+          version: info?.version ?? null,
+          uploadedAt: info?.uploaded_at ? formatDate(info.uploaded_at) : '',
+        };
+
+        const nodeId = widgetByAsset.get(asset.id);
+        if (nodeId) {
+          console.log(`  [sync] UPDATE asset=${asset.id} (${state.assetName}) → widget ${nodeId}`);
+          updates.push({ nodeId, state });
+        } else {
+          console.log(`  [sync] CREATE asset=${asset.id} (${state.assetName}) — no widget found`);
+          creates.push({ state });
+        }
+      }));
+
+      setStatus('Applying to board…');
+      console.log(`[freeframe] applying: ${updates.length} update(s), ${creates.length} create(s)`);
+      const result = await new Promise(resolve => { _onSyncDone = resolve; post({ type: 'apply-sync', updates, creates }); });
+      console.log('[freeframe] apply-sync result:', result);
+
+      if (result.error) throw new Error(result.error);
+
+      if (result.needsWidget) {
+        setStatus(`Add a Freeframe widget to the board first — ${result.needsWidget} new asset${result.needsWidget !== 1 ? 's' : ''} will be cloned from it`, 'error');
+        return;
+      }
+
+      const parts = [];
+      if (result.updated) parts.push(`${result.updated} updated`);
+      if (result.created) parts.push(`${result.created} created`);
+      setStatus('✓ ' + (parts.length ? parts.join(', ') : 'All widgets up to date'), 'success');
+    } catch (err) {
+      setStatus('Error: ' + err.message, 'error');
+    } finally {
+      syncBtn.disabled = false;
+      syncBtn.classList.remove('spinning');
+    }
+  }
+
+  function fetchThumbnail(cfg, url) {
+    if (!url) return Promise.resolve(null);
+    return new Promise(resolve => {
+      const id = ++_reqId;
+      _pending.set(id, { resolve, reject: () => resolve(null) });
+      post({
+        type: 'api-request-binary',
+        id,
+        url,
+        headers: { 'Authorization': `Bearer ${cfg.token}` },
+      });
+    });
+  }
+
+  function extractAssetId(url) {
+    try {
+      const parts = new URL(url).pathname.split('/');
+      const idx = parts.indexOf('assets');
+      return idx !== -1 ? parts[idx + 1] : null;
+    } catch { return null; }
+  }
+
+  function formatDate(iso) {
+    return new Date(iso).toLocaleDateString('en-US', { month: 'short', day: 'numeric', year: 'numeric' });
+  }
+
+  // ── utils ──────────────────────────────────────────────────────────────
+  function escHtml(s) {
+    return String(s ?? '').replace(/&/g, '&amp;').replace(/</g, '&lt;').replace(/>/g, '&gt;').replace(/"/g, '&quot;');
+  }
+
+  function assetIcon(type) {
+    if (!type) return '📄';
+    if (type.includes('video')) return '🎬';
+    if (type.includes('audio')) return '🎵';
+    if (type.includes('image')) return '🖼️';
+    return '📄';
+  }
+</script>
+</body>
+</html>
