@@ -1,0 +1,15 @@
+meta {
+  name: Revoke API Token
+  type: http
+  seq: 4
+}
+
+delete {
+  url: {{baseUrl}}/admin/api-tokens/PASTE_TOKEN_ID_HERE
+  body: none
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}

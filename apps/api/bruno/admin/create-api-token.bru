@@ -1,0 +1,23 @@
+meta {
+  name: Create API Token
+  type: http
+  seq: 2
+}
+
+post {
+  url: {{baseUrl}}/admin/api-tokens
+  body: json
+  auth: bearer
+}
+
+auth:bearer {
+  token: {{token}}
+}
+
+body:json {
+  {
+    "name": "Figma Plugin",
+    "user_id": "2b0a90ff-082e-4cd7-8585-93ac3521203e",
+    "expires_at": null
+  }
+}
