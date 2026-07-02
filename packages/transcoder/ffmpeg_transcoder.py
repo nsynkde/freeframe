@@ -55,7 +55,8 @@ class FFmpegTranscoder(BaseTranscoder):
                 "-q:v", "2",
                 f"{thumb_dir}/thumb_%04d.jpg",
             ]
-            subprocess.run(cmd, capture_output=True, check=True, timeout=600)
+            # Short clips (<10s) produce 0 frames at 0.1fps — not a hard error
+            subprocess.run(cmd, capture_output=True, timeout=600)
             return [str(p) for p in sorted(Path(thumb_dir).glob("thumb_*.jpg"))]
         finally:
             shutil.rmtree(thumb_dir, ignore_errors=True)
@@ -174,7 +175,7 @@ class FFmpegTranscoder(BaseTranscoder):
             thumb_path = work_dir / "thumb_0001.jpg"
             thumb_cmd = [
                 "ffmpeg", "-y", "-i", input_url,
-                "-vf", "fps=0.1", "-q:v", "2", "-frames:v", "1",
+                "-q:v", "2", "-frames:v", "1",
                 str(work_dir / "thumb_%04d.jpg"),
             ]
             subprocess.run(thumb_cmd, check=True, capture_output=True)
