@@ -110,7 +110,8 @@ function CreateTokenDialog({ users, onCreated }: { users: User[]; onCreated: (t:
   return (
     <Dialog.Root open={open} onOpenChange={(o) => { setOpen(o); if (!o) reset() }}>
       <Dialog.Trigger asChild>
-        <Button variant="primary" size="sm" icon={<Plus className="h-3.5 w-3.5" />}>
+        <Button variant="primary" size="sm">
+          <Plus className="h-3.5 w-3.5" />
           New Token
         </Button>
       </Dialog.Trigger>
