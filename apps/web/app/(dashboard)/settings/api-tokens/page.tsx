@@ -178,11 +178,11 @@ export default function ApiTokensPage() {
 
   const { data: tokens, isLoading: tokensLoading } = useSWR<ApiToken[]>(
     isSuperAdmin ? '/admin/api-tokens' : null,
-    () => api.get('/admin/api-tokens'),
+    () => api.get<ApiToken[]>('/admin/api-tokens'),
   )
   const { data: users } = useSWR<User[]>(
     isSuperAdmin ? '/admin/users' : null,
-    () => api.get('/admin/users'),
+    () => api.get<User[]>('/admin/users'),
   )
 
   React.useEffect(() => {
