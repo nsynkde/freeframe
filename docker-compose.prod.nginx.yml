@@ -1,0 +1,166 @@
+# ============================================================
+# FreeFrame — Production Docker Compose (external nginx)
+# ============================================================
+# Use this instead of docker-compose.prod.yml when TLS and
+# routing are handled by an nginx you already run on the host
+# (or in its own stack), instead of the bundled Traefik.
+#
+# Usage:
+#   cp .env.example .env.prod        # configure your settings
+#   docker compose --env-file .env.prod -f docker-compose.prod.nginx.yml up -d --build
+#
+# This compose file exposes:
+#   - api  on 127.0.0.1:8000
+#   - web  on 127.0.0.1:3000
+#
+# Point your nginx server block at them, e.g.:
+#
+#   location /api/ {
+#       proxy_pass http://127.0.0.1:8000/;
+#       proxy_set_header Host $host;
+#       proxy_set_header X-Real-IP $remote_addr;
+#       proxy_set_header X-Forwarded-Proto $scheme;
+#   }
+#
+#   location / {
+#       proxy_pass http://127.0.0.1:3000;
+#       proxy_set_header Host $host;
+#       proxy_set_header X-Real-IP $remote_addr;
+#       proxy_set_header X-Forwarded-Proto $scheme;
+#   }
+#
+# Note the trailing slash on the /api/ proxy_pass target — nginx
+# strips the /api prefix before forwarding, matching Traefik's
+# stripprefix middleware in docker-compose.prod.yml.
+#
+# If your nginx runs in its own Docker stack rather than on the
+# host, drop the 127.0.0.1 port bindings below and instead attach
+# api/web to a shared external network so nginx can reach them by
+# service name.
+# ============================================================
+
+services:
+  postgres:
+    image: postgres:15-alpine
+    env_file:
+      - .env.prod
+    volumes:
+      - pgdata:/var/lib/postgresql/data
+    healthcheck:
+      test: ["CMD-SHELL", "pg_isready -U $${POSTGRES_USER:-freeframe}"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  redis:
+    image: redis:7-alpine
+    command: >
+      sh -c "if [ -n \"$$REDIS_PASSWORD\" ]; then
+        redis-server --requirepass \"$$REDIS_PASSWORD\" --appendonly yes;
+      else
+        redis-server --appendonly yes;
+      fi"
+    env_file:
+      - .env.prod
+    volumes:
+      - redisdata:/data
+    healthcheck:
+      test: ["CMD-SHELL", "redis-cli -a \"$${REDIS_PASSWORD}\" --no-auth-warning ping || redis-cli ping"]
+      interval: 10s
+      timeout: 5s
+      retries: 5
+    restart: unless-stopped
+
+  api:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile.prod
+    env_file:
+      - .env.prod
+    environment:
+      - DISABLE_DOCS=true
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: >
+      sh -c "cd /workspace/apps/api && alembic upgrade head && cd /workspace &&
+      gunicorn apps.api.main:app
+      -w $${API_WORKERS:-4}
+      -k uvicorn.workers.UvicornWorker
+      --bind 0.0.0.0:8000
+      --timeout 120
+      --graceful-timeout 30"
+    healthcheck:
+      test: ["CMD", "curl", "-f", "http://localhost:8000/health"]
+      interval: 30s
+      timeout: 5s
+      start_period: 30s
+      retries: 3
+    ports:
+      - "127.0.0.1:8000:8000"
+    restart: unless-stopped
+
+  worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile.prod
+    env_file:
+      - .env.prod
+    depends_on:
+      postgres:
+        condition: service_healthy
+      redis:
+        condition: service_healthy
+    command: sh -c "celery -A apps.api.tasks.celery_app worker -Q transcoding -c $${TRANSCODING_CONCURRENCY:-2} --loglevel=warning"
+    restart: unless-stopped
+
+  email_worker:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile.prod
+    env_file:
+      - .env.prod
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: sh -c "celery -A apps.api.tasks.celery_app worker -Q email_high,email_low -c $${EMAIL_CONCURRENCY:-2} --loglevel=warning"
+    restart: unless-stopped
+
+  beat:
+    build:
+      context: .
+      dockerfile: apps/api/Dockerfile.prod
+    env_file:
+      - .env.prod
+    depends_on:
+      redis:
+        condition: service_healthy
+    command: sh -c "celery -A apps.api.tasks.celery_app beat --loglevel=warning -s /tmp/celerybeat-schedule"
+    restart: unless-stopped
+
+  web:
+    build:
+      context: ./apps/web
+      dockerfile: Dockerfile.prod
+      args:
+        NEXT_PUBLIC_API_URL: /api
+    env_file:
+      - .env.prod
+    depends_on:
+      - api
+    healthcheck:
+      test: ["CMD", "wget", "-q", "--spider", "http://127.0.0.1:3000"]
+      interval: 30s
+      timeout: 5s
+      start_period: 15s
+      retries: 3
+    ports:
+      - "127.0.0.1:3000:3000"
+    restart: unless-stopped
+
+volumes:
+  pgdata:
+  redisdata:
