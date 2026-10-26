@@ -351,7 +351,7 @@ def google_callback(
         "access_token": create_access_token(str(user.id)),
         "refresh_token": create_refresh_token(str(user.id)),
     })
-    return RedirectResponse(f"{frontend}/auth/oauth-callback#{fragment}")
+    return RedirectResponse(f"{frontend}/oauth-callback#{fragment}")
 
 
 @router.patch("/me/preferences", response_model=UserResponse)

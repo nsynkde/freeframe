@@ -151,7 +151,7 @@ export default function ProjectDetailPage() {
     removeReaction,
   } = useComments(selectedAsset?.id || null, selectedVersionId);
 
-  const { data: project, isLoading: loadingProject } = useSWR<Project>(
+  const { data: project, isLoading: loadingProject, mutate: mutateProject } = useSWR<Project>(
     `/projects/${projectId}`,
     () => api.get<Project>(`/projects/${projectId}`),
   );
@@ -201,6 +201,20 @@ export default function ProjectDetailPage() {
     showTrash ? null : `/projects/${projectId}/assets?${folderParam}`,
     (key: string) => api.get<AssetResponse[]>(key),
   );
+
+  type StorageCapacity = { free_bytes: number | null; total_bytes: number | null };
+  const { data: capacity, mutate: mutateCapacity } = useSWR<StorageCapacity>(
+    "/me/storage-capacity",
+    () => api.get<StorageCapacity>("/me/storage-capacity"),
+  );
+
+  // Refresh storage figures whenever the asset list changes (upload, delete, restore)
+  React.useEffect(() => {
+    if (assets) {
+      mutateProject();
+      mutateCapacity();
+    }
+  }, [assets, mutateProject, mutateCapacity]);
 
   // Subfolders for current view
   const { data: subfolders, mutate: mutateSubfolders } = useSWR<Folder[]>(
@@ -588,9 +602,10 @@ export default function ProjectDetailPage() {
 
         {/* Storage indicator — matches global sidebar bottom section (p-2 + space-y-1) */}
         {(() => {
-          const used = project?.storage_bytes ?? 0;
-          const limit = 10 * 1024 * 1024 * 1024; // 10 GB default limit
-          const pct = limit > 0 ? Math.min((used / limit) * 100, 100) : 0;
+          const total = capacity?.total_bytes ?? null;
+          const free = capacity?.free_bytes ?? null;
+          const hasCapacity = total !== null && free !== null && total > 0;
+          const pct = hasCapacity ? Math.min(((total - free) / total) * 100, 100) : 0;
           const isCritical = pct >= 90;
           const isWarning = pct >= 80;
           return (
@@ -602,10 +617,12 @@ export default function ProjectDetailPage() {
                     "text-[10px] tabular-nums",
                     isCritical ? "text-status-error font-medium" : isWarning ? "text-amber-400 font-medium" : "text-text-tertiary",
                   )}>
-                    {formatBytes(used)} / {formatBytes(limit)}
+                    {hasCapacity
+                      ? `${formatBytes(free)} free / ${formatBytes(total)}`
+                      : formatBytes(project?.storage_bytes ?? 0)}
                   </span>
                 </div>
-                <div className="h-1 w-full rounded-full bg-bg-hover overflow-hidden">
+                {hasCapacity && <div className="h-1 w-full rounded-full bg-bg-hover overflow-hidden">
                   <div
                     className={cn(
                       "h-full rounded-full transition-all duration-300",
@@ -613,7 +630,12 @@ export default function ProjectDetailPage() {
                     )}
                     style={{ width: `${Math.max(pct, 1)}%` }}
                   />
-                </div>
+                </div>}
+                {hasCapacity && (
+                  <span className="text-[10px] tabular-nums text-text-tertiary">
+                    This project: {formatBytes(project?.storage_bytes ?? 0)}
+                  </span>
+                )}
               </div>
               <div className="h-5" />
             </div>

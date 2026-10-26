@@ -2,7 +2,7 @@ import uuid
 from datetime import datetime
 from enum import Enum as PyEnum
 from typing import Optional
-from sqlalchemy import String, Enum, DateTime, JSON, func
+from sqlalchemy import String, Text, Enum, DateTime, JSON, func
 from sqlalchemy.dialects.postgresql import UUID
 from sqlalchemy.orm import Mapped, mapped_column
 try:
@@ -21,7 +21,7 @@ class User(Base):
     id: Mapped[uuid.UUID] = mapped_column(UUID(as_uuid=True), primary_key=True, default=uuid.uuid4)
     email: Mapped[str] = mapped_column(String(255), unique=True, nullable=False)
     name: Mapped[str] = mapped_column(String(255), nullable=False)
-    avatar_url: Mapped[Optional[str]] = mapped_column(String(500), nullable=True)
+    avatar_url: Mapped[Optional[str]] = mapped_column(Text, nullable=True)
     password_hash: Mapped[Optional[str]] = mapped_column(String(255), nullable=True)
     status: Mapped[UserStatus] = mapped_column(Enum(UserStatus), default=UserStatus.active)
     is_superadmin: Mapped[bool] = mapped_column(default=False)

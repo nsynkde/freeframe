@@ -15,8 +15,15 @@ from ..models.activity import Mention, Notification
 from ..models.comment import Comment
 from ..schemas.asset import AssetResponse, NotificationResponse
 from ..routers.assets import _build_asset_response, _build_asset_responses_bulk
+from ..services.s3_service import get_storage_capacity
 
 router = APIRouter(prefix="/me", tags=["me"])
+
+
+@router.get("/storage-capacity")
+def storage_capacity(current_user: User = Depends(get_current_user)):
+    """Free/total bytes of the object storage, or nulls if unavailable."""
+    return get_storage_capacity() or {"free_bytes": None, "total_bytes": None}
 
 
 @router.get("/assets", response_model=list[AssetResponse])

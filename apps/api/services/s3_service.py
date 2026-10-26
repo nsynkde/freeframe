@@ -1,7 +1,10 @@
 import json
 import os
 import re
+import time
 import boto3
+import httpx
+from jose import jwt
 from botocore.exceptions import ClientError
 from ..config import settings
 
@@ -60,6 +63,45 @@ def _get_presign_client():
     if endpoint:
         kwargs["endpoint_url"] = endpoint
     return boto3.client("s3", **kwargs)
+
+def _parse_capacity_metrics(text: str) -> dict | None:
+    """Pull usable free/total bytes out of MinIO's Prometheus cluster metrics."""
+    wanted = {
+        "minio_cluster_capacity_usable_free_bytes": "free_bytes",
+        "minio_cluster_capacity_usable_total_bytes": "total_bytes",
+    }
+    out = {}
+    for line in text.splitlines():
+        if line.startswith("#") or not line.strip():
+            continue
+        name = line.split("{", 1)[0].split()[0]
+        if name in wanted:
+            out[wanted[name]] = int(float(line.split()[-1]))
+    return out if len(out) == 2 else None
+
+def get_storage_capacity() -> dict | None:
+    """
+    Free/total bytes of the MinIO cluster via its Prometheus endpoint
+    (JWT signed with the S3 credentials, same as `mc admin prometheus generate`).
+    Returns None on AWS S3 (no capacity concept) or if MinIO refuses.
+    """
+    if _is_aws_s3():
+        return None
+    token = jwt.encode(
+        {"exp": int(time.time()) + 60, "sub": settings.s3_access_key, "iss": "prometheus"},
+        settings.s3_secret_key,
+        algorithm="HS512",
+    )
+    try:
+        resp = httpx.get(
+            f"{settings.s3_endpoint.rstrip('/')}/minio/v2/metrics/cluster",
+            headers={"Authorization": f"Bearer {token}"},
+            timeout=5,
+        )
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    return _parse_capacity_metrics(resp.text)
 
 def ensure_bucket_exists():
     """Create the S3 bucket if it does not exist. Called on app startup."""

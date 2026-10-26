@@ -7,23 +7,38 @@
 #
 # Usage:
 #   cp .env.example .env.prod        # configure your settings
-#   docker compose --env-file .env.prod -f docker-compose.prod.nginx.yml up -d --build
+#   docker compose --env-file .env.prod -f docker-compose.prod.nginx.yml pull
+#   docker compose --env-file .env.prod -f docker-compose.prod.nginx.yml up -d
 #
-# This compose file exposes:
-#   - api  on 127.0.0.1:8000
-#   - web  on 127.0.0.1:3000
+# Images are pulled from containers.nsynk.de (built by .woodpecker/prod.yml).
+# Watchtower on the prod server can pick up new :latest pushes automatically.
 #
-# Point your nginx server block at them, e.g.:
+# This compose file exposes api/web on all interfaces:
+#   - api  on :8000
+#   - web  on :3000
+#
+# Point your nginx server block at this host's IP, e.g.:
 #
 #   location /api/ {
-#       proxy_pass http://127.0.0.1:8000/;
+#       proxy_pass http://<this-host-ip>:8000/;
 #       proxy_set_header Host $host;
 #       proxy_set_header X-Real-IP $remote_addr;
 #       proxy_set_header X-Forwarded-Proto $scheme;
 #   }
 #
 #   location / {
-#       proxy_pass http://127.0.0.1:3000;
+#       proxy_pass http://<this-host-ip>:3000;
+#       proxy_set_header Host $host;
+#       proxy_set_header X-Real-IP $remote_addr;
+#       proxy_set_header X-Forwarded-Proto $scheme;
+#   }
+#
+#   # Required for video playback — the HLS proxy's manifest rewriter
+#   # embeds root-relative /stream/hls/... URLs directly in the .m3u8
+#   # content (see apps/api/routers/hls_proxy.py), so they must resolve
+#   # against the API directly, without going through /api/.
+#   location /stream/ {
+#       proxy_pass http://<this-host-ip>:8000/stream/;
 #       proxy_set_header Host $host;
 #       proxy_set_header X-Real-IP $remote_addr;
 #       proxy_set_header X-Forwarded-Proto $scheme;
@@ -31,12 +46,18 @@
 #
 # Note the trailing slash on the /api/ proxy_pass target — nginx
 # strips the /api prefix before forwarding, matching Traefik's
-# stripprefix middleware in docker-compose.prod.yml.
+# stripprefix middleware in docker-compose.prod.yml. The /stream/
+# location above does NOT strip a prefix, since hls_proxy.router is
+# mounted at /stream (not /api/stream) on the FastAPI app itself.
 #
-# If your nginx runs in its own Docker stack rather than on the
-# host, drop the 127.0.0.1 port bindings below and instead attach
-# api/web to a shared external network so nginx can reach them by
-# service name.
+# SECURITY: ports 8000/3000 are reachable from any host that can
+# route to this machine, not just your nginx box. Lock this down
+# with a firewall rule restricting those ports to the nginx host's
+# IP (e.g. `ufw allow from <nginx-ip> to any port 8000,3000`).
+#
+# If nginx runs on this same host instead, change the ports below
+# back to "127.0.0.1:8000:8000" / "127.0.0.1:3000:3000" so they
+# aren't reachable from the network at all.
 # ============================================================
 
 services:
@@ -73,9 +94,7 @@ services:
     restart: unless-stopped
 
   api:
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile.prod
+    image: containers.nsynk.de/freeframe/api:latest
     env_file:
       - .env.prod
     environment:
@@ -100,13 +119,11 @@ services:
       start_period: 30s
       retries: 3
     ports:
-      - "127.0.0.1:8000:8000"
+      - "8000:8000"
     restart: unless-stopped
 
   worker:
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile.prod
+    image: containers.nsynk.de/freeframe/api:latest
     env_file:
       - .env.prod
     depends_on:
@@ -118,9 +135,7 @@ services:
     restart: unless-stopped
 
   email_worker:
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile.prod
+    image: containers.nsynk.de/freeframe/api:latest
     env_file:
       - .env.prod
     depends_on:
@@ -130,9 +145,7 @@ services:
     restart: unless-stopped
 
   beat:
-    build:
-      context: .
-      dockerfile: apps/api/Dockerfile.prod
+    image: containers.nsynk.de/freeframe/api:latest
     env_file:
       - .env.prod
     depends_on:
@@ -142,11 +155,7 @@ services:
     restart: unless-stopped
 
   web:
-    build:
-      context: ./apps/web
-      dockerfile: Dockerfile.prod
-      args:
-        NEXT_PUBLIC_API_URL: /api
+    image: containers.nsynk.de/freeframe/web:latest
     env_file:
       - .env.prod
     depends_on:
@@ -158,7 +167,7 @@ services:
       start_period: 15s
       retries: 3
     ports:
-      - "127.0.0.1:3000:3000"
+      - "3000:3000"
     restart: unless-stopped
 
 volumes:
