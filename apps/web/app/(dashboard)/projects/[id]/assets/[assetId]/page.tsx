@@ -316,6 +316,7 @@ function ReviewScreenInner({ projectId }: { projectId: string }) {
             compareComments={compareComments}
             onAudioSourceChange={setAudioSource}
             className="flex-1 min-h-0"
+            versionId={currentVersion?.id}
             compareVersionId={compareVersionId}
             currentVersionNumber={currentVersion?.version_number}
             compareVersionNumber={compareVersion?.version_number}

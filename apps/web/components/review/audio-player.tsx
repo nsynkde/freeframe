@@ -104,7 +104,7 @@ export function AudioPlayer({ asset, version, comments = [], className }: AudioP
       setDuration(0)
 
       try {
-        const data = await api.get<StreamResponse>(`/assets/${asset.id}/stream`)
+        const data = await api.get<StreamResponse>(`/assets/${asset.id}/stream?version_id=${version.id}`)
         if (!cancelled) setAudioUrl(data.url)
       } catch (err) {
         if (!cancelled) {

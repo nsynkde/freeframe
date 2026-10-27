@@ -38,6 +38,8 @@ interface VideoPlayerProps {
   className?: string;
   /** Pre-fetched stream URL (for share mode — skips authenticated API call) */
   initialStreamUrl?: string | null;
+  /** Version ID to play (defaults to the latest version) */
+  versionId?: string | null;
   /** Version ID to compare against (renders split layout with shared controls) */
   compareVersionId?: string | null;
   /** Version numbers shown as labels in split-screen compare mode */
@@ -146,6 +148,7 @@ export function VideoPlayer({
   overlay,
   className,
   initialStreamUrl,
+  versionId,
   compareVersionId,
   currentVersionNumber,
   compareVersionNumber,
@@ -201,10 +204,12 @@ export function VideoPlayer({
       return;
     }
     api
-      .get<StreamUrlResponse>(`/assets/${assetId}/stream`)
+      .get<StreamUrlResponse>(
+        versionId ? `/assets/${assetId}/stream?version_id=${versionId}` : `/assets/${assetId}/stream`,
+      )
       .then((data) => setStreamUrl(resolveUrl(data.url)))
       .catch(() => {});
-  }, [assetId, initialStreamUrl]);
+  }, [assetId, initialStreamUrl, versionId]);
 
   // Load compare stream URL
   useEffect(() => {
