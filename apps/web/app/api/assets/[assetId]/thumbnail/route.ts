@@ -2,10 +2,10 @@ import { NextRequest, NextResponse } from 'next/server';
 
 export async function GET(
   _req: NextRequest,
-  { params }: { params: { assetId: string } },
+  { params }: { params: Promise<{ assetId: string }> },
 ) {
   const api = process.env.API_INTERNAL_URL ?? process.env.NEXT_PUBLIC_API_URL ?? 'http://localhost:8000';
-  const res = await fetch(`${api}/assets/${params.assetId}/thumbnail`);
+  const res = await fetch(`${api}/assets/${(await params).assetId}/thumbnail`);
   if (!res.ok) return new NextResponse(null, { status: res.status });
   const blob = await res.blob();
   return new NextResponse(blob, {
