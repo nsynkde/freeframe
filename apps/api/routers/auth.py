@@ -344,6 +344,8 @@ def google_callback(
         if avatar_url and not user.avatar_url:
             user.avatar_url = avatar_url
         user.email_verified = True
+        if user.status == UserStatus.pending_verification:
+            user.status = UserStatus.active
 
     db.commit()
 
