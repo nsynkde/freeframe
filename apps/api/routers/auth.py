@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, status
 from fastapi.responses import RedirectResponse
 from sqlalchemy.orm import Session
-from urllib.parse import urlencode
+from urllib.parse import urlencode, urlparse
 import uuid
 import secrets
 import time
@@ -35,6 +35,9 @@ from ..models.instance_branding import InstanceBranding
 from ..middleware.auth import get_current_user
 from ..middleware.rate_limit import rate_limit
 from ..config import settings
+from ..services import s3_service
+from ..services.avatar_keys import avatar_prefix, is_own_avatar_key
+from .users import AVATAR_CONTENT_TYPES, AVATAR_MAX_BYTES
 
 router = APIRouter(prefix="/auth", tags=["auth"])
 
@@ -59,6 +62,35 @@ def _verify_oauth_state(state: str) -> bool:
         return hmac.compare_digest(sig, expected) and int(exp) > int(time.time())
     except Exception:
         return False
+
+
+def _store_google_avatar(user_id: uuid.UUID, picture_url: str) -> str | None:
+    """Copy the Google profile picture into storage as the user's own avatar.
+
+    `User.avatar_url` holds a storage key under avatars/<user id>/ (see
+    services.avatar_keys); a Google URL stored there is treated as no avatar.
+    Returns the new key, or None if the picture could not be copied.
+    """
+    # Only fetch from Google's image host, never an arbitrary URL.
+    if not (urlparse(picture_url).hostname or "").endswith(".googleusercontent.com"):
+        return None
+    try:
+        resp = httpx.get(picture_url, timeout=5)
+        resp.raise_for_status()
+    except httpx.HTTPError:
+        return None
+    content_type = resp.headers.get("content-type", "").split(";")[0].strip()
+    ext = AVATAR_CONTENT_TYPES.get(content_type)
+    if not ext or len(resp.content) > AVATAR_MAX_BYTES:
+        return None
+    key = f"{avatar_prefix(user_id)}{uuid.uuid4()}.{ext}"
+    try:
+        s3_service.put_object(key, resp.content, content_type=content_type)
+    except Exception:
+        return None
+    return key
+
+
 # One message for every magic-code failure. Reporting "too many attempts"
 # separately would tell a caller which addresses are registered (only a real
 # account ever gets a code issued, so only a real account can exhaust its
@@ -330,7 +362,7 @@ def google_callback(
     email: str = info["email"]
     google_id: str = info["sub"]
     name: str = info.get("name") or email.split("@")[0]
-    avatar_url: str | None = info.get("picture")
+    picture_url: str | None = info.get("picture")
 
     if settings.google_allowed_domain and not email.endswith(f"@{settings.google_allowed_domain}"):
         return RedirectResponse(f"{frontend}/login?error=domain_not_allowed")
@@ -347,7 +379,6 @@ def google_callback(
             email=email,
             name=name,
             google_id=google_id,
-            avatar_url=avatar_url,
             status=UserStatus.active,
             email_verified=True,
             is_superadmin=user_count == 0,
@@ -358,11 +389,18 @@ def google_callback(
             return RedirectResponse(f"{frontend}/login?error=account_deactivated")
         if not user.google_id:
             user.google_id = google_id
-        if avatar_url and not user.avatar_url:
-            user.avatar_url = avatar_url
         user.email_verified = True
         if user.status == UserStatus.pending_verification:
             user.status = UserStatus.active
+
+    db.flush()  # assigns user.id for a new user
+    # Only when the user has no avatar of their own yet (also replaces a raw
+    # Google URL stored before avatars became storage keys); never overwrites
+    # an uploaded one, and a stored copy means later logins skip the download.
+    if picture_url and not is_own_avatar_key(user.id, user.avatar_url):
+        key = _store_google_avatar(user.id, picture_url)
+        if key:
+            user.avatar_url = key
 
     db.commit()
 
