@@ -8,7 +8,7 @@ import { useReviewStore } from '@/stores/review-store'
 export type DrawingTool = 'pen' | 'rectangle' | 'arrow' | 'line'
 
 export interface UseDrawingReturn {
-  canvasRef: React.RefObject<HTMLCanvasElement>
+  canvasRef: React.RefObject<HTMLCanvasElement | null>
   resize: (width: number, height: number) => void
   clear: () => void
   undo: () => void
@@ -324,6 +324,10 @@ export function useDrawing(): UseDrawingReturn {
     // when the container size differs from when the annotation was drawn.
     json._canvasWidth = sharedFabric.width
     json._canvasHeight = sharedFabric.height
+    // Marks these coordinates as media-space (the picture/video box) rather than
+    // the letterboxed container, so the overlay never has to guess. Data without
+    // it predates the frame fix and is replayed against the container.
+    json._frameSpace = 'media'
     return json
   }, [])
 

@@ -9,18 +9,22 @@ import {
   Volume2,
   VolumeX,
   ChevronUp,
+  ChevronRight,
   Check,
   Repeat,
   Columns2,
   Rows2,
   Layers,
   FlipHorizontal2,
+  MoreHorizontal,
 } from "lucide-react";
 import { cn, formatTime, formatTimecode, formatFrames } from "@/lib/utils";
+import { renderedMediaBox } from "@/lib/media-frame";
 import { api } from "@/lib/api";
 import { useReviewStore, type TimeFormat } from "@/stores/review-store";
 import { useVideoPlayer } from "@/hooks/use-video-player";
 import { useHlsVideo } from "@/hooks/use-hls-video";
+import { useMediaQuery, MEDIA_SM } from "@/hooks/use-media-query";
 import { useReview } from "./review-provider";
 import { ProgressBar } from "./progress-bar";
 import type { Comment } from "@/types";
@@ -38,8 +42,6 @@ interface VideoPlayerProps {
   className?: string;
   /** Pre-fetched stream URL (for share mode — skips authenticated API call) */
   initialStreamUrl?: string | null;
-  /** Version ID to play (defaults to the latest version) */
-  versionId?: string | null;
   /** Version ID to compare against (renders split layout with shared controls) */
   compareVersionId?: string | null;
   /** Version numbers shown as labels in split-screen compare mode */
@@ -56,12 +58,16 @@ interface VideoPlayerProps {
 /**
  * Wraps children so they are positioned exactly over the visible video frame,
  * excluding the black letterbox bars created by object-contain.
+ *
+ * Exported for the compare overlay: annotations are AUTHORED inside this
+ * constraint (video-frame coordinates), so any viewer that renders them must
+ * mount the overlay in the same space.
  */
-function VideoFrameConstraint({
+export function VideoFrameConstraint({
   videoRef,
   children,
 }: {
-  videoRef: React.RefObject<HTMLVideoElement>;
+  videoRef: React.RefObject<HTMLVideoElement | null>;
   children: React.ReactNode;
 }) {
   const wrapperRef = useRef<HTMLDivElement>(null);
@@ -72,42 +78,34 @@ function VideoFrameConstraint({
     if (!video) return;
 
     const calc = () => {
-      const container = video.parentElement;
-      if (!container) return;
+      // Measured from the element's own box, exactly like the image constraint.
+      // The main player's <video> is `w-full h-full object-contain`, so its box
+      // IS the container and this reduces to fitting against the container. The
+      // compare panes use `max-h-full max-w-full`, where the element only ever
+      // shrinks and so already hugs the picture — deriving the fit from the
+      // container there would upscale the box and misplace every annotation.
+      const box = renderedMediaBox({
+        naturalWidth: video.videoWidth,
+        naturalHeight: video.videoHeight,
+        elementWidth: video.offsetWidth,
+        elementHeight: video.offsetHeight,
+        offsetLeft: video.offsetLeft,
+        offsetTop: video.offsetTop,
+      });
 
-      const cw = container.clientWidth;
-      const ch = container.clientHeight;
-      const vw = video.videoWidth;
-      const vh = video.videoHeight;
-
-      if (!vw || !vh) {
+      if (!box) {
+        // Not laid out yet — fill the container and recompute on the next
+        // loadedmetadata/resize.
         setStyle({ position: "absolute", inset: 0 });
         return;
       }
 
-      const containerAspect = cw / ch;
-      const videoAspect = vw / vh;
-
-      let renderW: number, renderH: number, offsetX: number, offsetY: number;
-
-      if (videoAspect > containerAspect) {
-        renderW = cw;
-        renderH = cw / videoAspect;
-        offsetX = 0;
-        offsetY = (ch - renderH) / 2;
-      } else {
-        renderH = ch;
-        renderW = ch * videoAspect;
-        offsetX = (cw - renderW) / 2;
-        offsetY = 0;
-      }
-
       setStyle({
         position: "absolute",
-        left: offsetX,
-        top: offsetY,
-        width: renderW,
-        height: renderH,
+        left: box.left,
+        top: box.top,
+        width: box.width,
+        height: box.height,
       });
     };
 
@@ -115,7 +113,11 @@ function VideoFrameConstraint({
     video.addEventListener("loadedmetadata", calc);
     video.addEventListener("resize", calc);
 
+    // Observe both: under `max-*` a container resize only RECENTRES the element,
+    // moving offsetLeft/offsetTop without changing its own box, and
+    // ResizeObserver does not fire on a position-only change.
     const ro = new ResizeObserver(calc);
+    ro.observe(video);
     if (video.parentElement) ro.observe(video.parentElement);
 
     return () => {
@@ -148,7 +150,6 @@ export function VideoPlayer({
   overlay,
   className,
   initialStreamUrl,
-  versionId,
   compareVersionId,
   currentVersionNumber,
   compareVersionNumber,
@@ -160,15 +161,53 @@ export function VideoPlayer({
   const [compareStreamUrl, setCompareStreamUrl] = useState<string | null>(null);
   const [loop, setLoop] = useState(false);
 
-  const { isDrawingMode, timeFormat, setTimeFormat, setPlayheadTime } =
+  const { isDrawingMode, timeFormat, setTimeFormat, setPlayheadTime, currentVersion } =
     useReviewStore();
-  const { registerPauseHandler } = useReview();
+  const { registerPauseHandler, registerTogglePlayHandler } = useReview();
   const [timeFormatOpen, setTimeFormatOpen] = useState(false);
+  // The media's own width/height ratio, used to size the stage on a portrait
+  // phone. 16/9 until `loadedmetadata` lands, so nothing jumps in the common
+  // case. See the stage below for why this is needed at all.
+  const [mediaAspect, setMediaAspect] = useState(16 / 9);
+
+  // Below `sm` the transport row runs out of width and the controls crowd, so
+  // the secondary ones move behind an overflow menu and the primary ones get a
+  // 44px touch target instead of 28px.
+  const compact = !useMediaQuery(MEDIA_SM);
+  const [overflowOpen, setOverflowOpen] = useState(false);
+  // The Quality row in the overflow menu swaps the menu's rows for the list of
+  // rungs; the menu starts on its own rows each time it opens.
+  const [qualityListOpen, setQualityListOpen] = useState(false);
+  const overflowRef = useRef<HTMLDivElement>(null);
   const timeFormatRef = useRef<HTMLDivElement>(null);
   const [compareMode, setCompareMode] = useState<'columns' | 'rows' | 'wipe' | 'overlay'>('columns');
   const [wipePosition, setWipePosition] = useState(50);
   const [overlayOpacity, setOverlayOpacity] = useState(50);
   const [audioSource, setAudioSource] = useState<'primary' | 'compare'>('primary');
+  const stageRef = useRef<HTMLDivElement>(null);
+  const swallowStageClickRef = useRef(false);
+
+  // Close the overflow menu on an outside press. `pointerdown`, not
+  // `mousedown`: the scrubber calls preventDefault on its own pointer events,
+  // and a touch there would otherwise never produce the compatibility mouse
+  // event this needs to hear.
+  useEffect(() => {
+    if (!overflowOpen) return;
+    const onDown = (e: PointerEvent) => {
+      if (!overflowRef.current?.contains(e.target as Node)) {
+        setOverflowOpen(false);
+        if (stageRef.current?.contains(e.target as Node)) {
+          swallowStageClickRef.current = true;
+        }
+      }
+    };
+    document.addEventListener("pointerdown", onDown);
+    return () => document.removeEventListener("pointerdown", onDown);
+  }, [overflowOpen]);
+
+  useEffect(() => {
+    if (!overflowOpen) setQualityListOpen(false);
+  }, [overflowOpen]);
 
   useEffect(() => {
     if (!timeFormatOpen) return;
@@ -176,8 +215,12 @@ export function VideoPlayer({
       if (
         timeFormatRef.current &&
         !timeFormatRef.current.contains(e.target as Node)
-      )
+      ) {
         setTimeFormatOpen(false);
+        if (stageRef.current?.contains(e.target as Node)) {
+          swallowStageClickRef.current = true;
+        }
+      }
     };
     document.addEventListener("mousedown", handleClick);
     return () => document.removeEventListener("mousedown", handleClick);
@@ -196,19 +239,41 @@ export function VideoPlayer({
     }
   }
 
-  // Load primary stream URL
+  // Load the stream URL — reset immediately on asset OR version change so the old
+  // video doesn't keep playing while the new URL is being fetched.
+  const versionId = currentVersion?.id;
   useEffect(() => {
+    // Guard against a superseded fetch: rapid version switching starts overlapping
+    // requests, and without this a slower earlier response could land last and leave
+    // the player on the wrong version's stream.
+    let ignore = false;
     setStreamUrl(null);
     if (initialStreamUrl) {
       setStreamUrl(resolveUrl(initialStreamUrl));
       return;
     }
+    // Pin the stream to the selected version — without version_id the API falls
+    // back to the latest version, so the switcher never actually changes the
+    // playing stream (#66).
+    const streamPath = versionId
+      ? `/assets/${assetId}/stream?version_id=${versionId}`
+      : `/assets/${assetId}/stream`;
     api
-      .get<StreamUrlResponse>(
-        versionId ? `/assets/${assetId}/stream?version_id=${versionId}` : `/assets/${assetId}/stream`,
-      )
-      .then((data) => setStreamUrl(resolveUrl(data.url)))
-      .catch(() => {});
+      .get<StreamUrlResponse>(streamPath)
+      .then((data) => {
+        if (ignore) return;
+        // HLS proxy returns relative paths — prepend API URL
+        const url = data.url.startsWith("/")
+          ? `${process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000"}${data.url}`
+          : data.url;
+        setStreamUrl(url);
+      })
+      .catch(() => {
+        /* stream URL errors handled by player error state */
+      });
+    return () => {
+      ignore = true;
+    };
   }, [assetId, initialStreamUrl, versionId]);
 
   // Load compare stream URL
@@ -225,6 +290,7 @@ export function VideoPlayer({
 
   const player = useVideoPlayer(streamUrl);
   const compare = useHlsVideo(compareStreamUrl);
+  const compareVideoRef = compare.videoRef;
 
   const {
     videoRef,
@@ -237,10 +303,12 @@ export function VideoPlayer({
     playbackRate,
     qualityLevels,
     currentQuality,
+    selectedQuality,
     isLoading,
     isFullscreen,
     error,
     pause: _pause,
+    togglePlay: _togglePlay,
     seek: _seek,
     setPlaybackRate: _setPlaybackRate,
     setQuality,
@@ -253,40 +321,43 @@ export function VideoPlayer({
 
   const play = useCallback(() => {
     videoRef.current?.play().catch(() => {});
-    compare.videoRef.current?.play().catch(() => {});
-  }, [videoRef, compare.videoRef]);
+    compareVideoRef.current?.play().catch(() => {});
+  }, [videoRef, compareVideoRef]);
 
   const pause = useCallback(() => {
     _pause();
-    compare.videoRef.current?.pause();
-  }, [_pause, compare.videoRef]);
+    compareVideoRef.current?.pause();
+  }, [_pause, compareVideoRef]);
 
   const seek = useCallback(
     (time: number) => {
       _seek(time);
-      const b = compare.videoRef.current;
+      const b = compareVideoRef.current;
       if (b) b.currentTime = Math.max(0, Math.min(time, b.duration || 0));
     },
-    [_seek, compare.videoRef],
+    [_seek, compareVideoRef],
   );
 
+  // Primary goes through the hook's toggle (keeps its iOS first-tap retry);
+  // the compare video just follows.
   const togglePlay = useCallback(() => {
     const video = videoRef.current;
     if (!video) return;
-    if (video.paused) {
-      play();
-    } else {
-      pause();
-    }
-  }, [videoRef, play, pause]);
+    const wasPaused = video.paused;
+    _togglePlay();
+    const b = compareVideoRef.current;
+    if (!b) return;
+    if (wasPaused) b.play().catch(() => {});
+    else b.pause();
+  }, [videoRef, _togglePlay, compareVideoRef]);
 
   const setPlaybackRate = useCallback(
     (rate: number) => {
       _setPlaybackRate(rate);
-      if (compare.videoRef.current)
-        compare.videoRef.current.playbackRate = rate;
+      if (compareVideoRef.current)
+        compareVideoRef.current.playbackRate = rate;
     },
-    [_setPlaybackRate, compare.videoRef],
+    [_setPlaybackRate, compareVideoRef],
   );
 
   // ─── Stall sync — pause both when either buffers, resume when both ready ──
@@ -294,7 +365,7 @@ export function VideoPlayer({
   useEffect(() => {
     if (!compareVersionId) return;
     const a = videoRef.current;
-    const b = compare.videoRef.current;
+    const b = compareVideoRef.current;
     if (!a || !b) return;
 
     const s = { a: false, b: false, wasPlaying: false };
@@ -348,14 +419,14 @@ export function VideoPlayer({
   // Sync muted state to whichever video is the audio source
   useEffect(() => {
     const a = videoRef.current;
-    const b = compare.videoRef.current;
+    const b = compareVideoRef.current;
     if (!compareVersionId) {
       if (b) b.muted = true;
       return;
     }
     if (a) a.muted = audioSource === 'compare';
     if (b) b.muted = audioSource !== 'compare';
-  }, [audioSource, compareVersionId, videoRef, compare.videoRef]);
+  }, [audioSource, compareVersionId, videoRef, compareVideoRef]);
 
   // Reset audio source when compare is dismissed
   useEffect(() => {
@@ -366,13 +437,42 @@ export function VideoPlayer({
   useEffect(() => {
     onAudioSourceChange?.(audioSource);
   }, [audioSource, onAudioSourceChange]);
+  const currentQualityLabel = qualityLevels.find((level) => level.index === currentQuality)?.label;
+  const autoQualityLabel = currentQualityLabel ? "Auto (" + currentQualityLabel + ")" : "Auto";
+  const selectedQualityLabel = selectedQuality === -1
+    ? autoQualityLabel
+    : qualityLevels.find((level) => level.index === selectedQuality)?.label ?? "Auto";
+
+  // A source can be vertical or 4:3, so the stage must not assume 16:9.
+  // `resize` covers a version switch that changes the dimensions without
+  // remounting the element.
+  useEffect(() => {
+    const video = videoRef.current;
+    if (!video) return;
+    const read = () => {
+      if (video.videoWidth && video.videoHeight) {
+        setMediaAspect(video.videoWidth / video.videoHeight);
+      }
+    };
+    read();
+    video.addEventListener("loadedmetadata", read);
+    video.addEventListener("resize", read);
+    return () => {
+      video.removeEventListener("loadedmetadata", read);
+      video.removeEventListener("resize", read);
+    };
+  }, [videoRef, streamUrl]);
 
   // Register pause handler with review provider
   useEffect(() => {
     registerPauseHandler(pause);
   }, [registerPauseHandler, pause]);
 
-  // Sync video currentTime to review store
+  // And the toggle, for the mobile comment sheet's play/pause button, so it
+  // gets the same first-tap retry and pause disarm as this player's own.
+  useEffect(() => registerTogglePlayHandler(togglePlay), [registerTogglePlayHandler, togglePlay]);
+
+  // Sync video currentTime to review store so comment input shows same timecode
   const lastSyncRef = useRef(0);
   useEffect(() => {
     const now = Date.now();
@@ -423,6 +523,10 @@ export function VideoPlayer({
   }, [togglePlay, seek, currentTime, isDrawingMode]);
 
   const handleContainerClick = useCallback(() => {
+    if (swallowStageClickRef.current) {
+      swallowStageClickRef.current = false;
+      return;
+    }
     if (!isDrawingMode) {
       togglePlay();
     }
@@ -446,6 +550,15 @@ export function VideoPlayer({
     <div
       ref={containerRef}
       className={cn(
+        // Top-aligned in portrait, deliberately. The stage is a fixed-ratio box,
+        // so on a portrait phone there is almost always leftover height, and how
+        // much depends entirely on the source: a 9:16 clip leaves ~65px, a
+        // cinematic one leaves ~470px because it is only ~180px tall at full
+        // width. Centring that much slack floats the picture in the middle of
+        // the screen with a large gap above it, and pushes the drawing surface
+        // away from the thumb. Keeping the media under the header puts the
+        // leftover between the controls and the comment sheet, which is where
+        // the sheet expands into anyway.
         "flex flex-col h-full w-full",
         isFullscreen && "fixed inset-0 z-50",
         className,
@@ -453,7 +566,40 @@ export function VideoPlayer({
     >
       {/* Video area */}
       <div
-        className="flex-1 relative min-h-0 bg-black overflow-hidden cursor-pointer"
+        ref={stageRef}
+        onPointerDownCapture={() => {
+          swallowStageClickRef.current = false;
+        }}
+        // On a portrait phone the stage used to be `flex-1` with no relationship
+        // to the media, so it took every pixel the column had left and
+        // `object-contain` letterboxed a 16:9 video inside a box twice its
+        // height: ~200px of black above and below, with the controls pushed off
+        // the bottom (#331). Below `md` in portrait it is sized from the media's
+        // own ratio instead. Everywhere else it fills the column exactly as
+        // before, so desktop is untouched.
+        className={cn(
+          "relative min-h-0 bg-black overflow-hidden cursor-pointer touch-manipulation",
+          // w-full is load-bearing. With only `aspect-ratio` + `max-height`, the
+          // clamped height makes the width definite via the ratio, so
+          // `align-items: stretch` no longer applies and the stage ends up
+          // narrower than the column and flush left: a 608x1080 source measured
+          // 302px wide in a 440px column on an iPhone 16 Pro Max, with all 138px
+          // of letterbox on the right. Pinning the width instead lets
+          // `object-contain` centre the picture and split the bands evenly.
+          // (Do not reach for `mx-auto` here: auto cross-axis margins also
+          // disable stretch, and the width then collapses to the content width,
+          // which is 0 because the video is absolutely positioned.)
+          "flex-1 max-md:portrait:flex-none max-md:portrait:w-full max-md:portrait:aspect-[var(--stage-aspect)]",
+          // A vertical source (9:16) is taller than the screen at full width, so
+          // the ratio alone would push the controls back off the bottom. Cap it
+          // and let `object-contain` do the rest.
+          // The consumer sets --ff-stage-max to the height actually left above
+          // the comment sheet, so the whole frame stays visible as the sheet
+          // opens. 70dvh is the fallback for surfaces with no sheet, where the
+          // only job is to stop a vertical source pushing the controls off.
+          "max-md:portrait:max-h-[var(--ff-stage-max,70dvh)]",
+        )}
+        style={{ "--stage-aspect": String(mediaAspect) } as React.CSSProperties}
         onClick={handleContainerClick}
       >
         {/* Both slots stay in the DOM when comparing — mode is driven by CSS only so videoRefs never remount */}
@@ -461,7 +607,7 @@ export function VideoPlayer({
           {/* Primary slot */}
           <div
             className={cn(
-              "relative overflow-hidden",
+              "relative overflow-hidden touch-manipulation",
               !compareVersionId
                 ? "w-full"
                 : compareMode === 'columns'
@@ -517,7 +663,7 @@ export function VideoPlayer({
           {compareVersionId && (
             <div
               className={cn(
-                "relative overflow-hidden",
+                "relative overflow-hidden touch-manipulation",
                 compareMode === 'columns' || compareMode === 'rows' ? "flex-1" : "absolute inset-0",
               )}
               style={compareMode === 'wipe' ? { clipPath: `inset(0 ${100 - wipePosition}% 0 0)` } : undefined}
@@ -536,7 +682,7 @@ export function VideoPlayer({
                 <Volume2 className="h-3 w-3" />
               </button>
               <video
-                ref={compare.videoRef}
+                ref={compareVideoRef}
                 className="absolute inset-0 w-full h-full object-contain"
                 style={{ opacity: compareMode === 'overlay' ? overlayOpacity / 100 : 1 }}
                 playsInline
@@ -577,13 +723,22 @@ export function VideoPlayer({
         />
       </div>
 
-      {/* Bottom transport bar */}
-      <div className="flex items-center justify-between h-12 px-4 bg-bg-secondary/80 border-t border-border shrink-0">
+      {/* Bottom transport bar (matches audio player style) */}
+      <div
+        className={cn(
+          "flex items-center justify-between bg-bg-secondary/80 border-t border-border shrink-0",
+          // min-h, not h: the row carries its own safe-area padding below, and a
+          // fixed height would let that padding eat into the 44px buttons rather
+          // than growing the row.
+          compact ? "min-h-12 gap-1 px-3" : "h-12 px-4",
+        )}
+        style={compact ? { paddingBottom: "env(safe-area-inset-bottom)" } : undefined}
+      >
         {/* Left: Play, Loop, Speed, Volume */}
         <div className="flex items-center gap-2">
           <button
             onClick={togglePlay}
-            className="flex h-7 w-7 items-center justify-center rounded text-text-primary hover:bg-bg-hover transition-colors"
+            className={cn("flex items-center justify-center rounded text-text-primary hover:bg-bg-hover transition-colors", compact ? "h-11 w-11" : "h-7 w-7")}
             aria-label={isPlaying ? "Pause" : "Play"}
           >
             {isPlaying ? (
@@ -593,38 +748,42 @@ export function VideoPlayer({
             )}
           </button>
 
-          <button
-            onClick={() => setLoop((p) => !p)}
-            className={cn(
-              "flex h-7 w-7 items-center justify-center rounded transition-colors",
-              loop
-                ? "text-accent bg-accent/10"
-                : "text-text-tertiary hover:text-text-secondary hover:bg-bg-hover",
+            {!compact && (
+              <>
+            <button
+              onClick={() => setLoop((p) => !p)}
+              className={cn(
+                "flex h-7 w-7 items-center justify-center rounded transition-colors",
+                loop
+                  ? "text-accent bg-accent/10"
+                  : "text-text-tertiary hover:text-text-secondary hover:bg-bg-hover",
+              )}
+              aria-label="Loop"
+            >
+              <Repeat className="h-4 w-4" />
+            </button>
+  
+            <button
+              onClick={handleSpeedCycle}
+              className="flex h-7 items-center justify-center rounded px-1.5 text-xs font-medium text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors tabular-nums"
+              aria-label="Playback speed"
+            >
+              {playbackRate}x
+            </button>
+  
+            <button
+              onClick={toggleMute}
+              className="flex h-7 w-7 items-center justify-center rounded text-text-tertiary hover:text-text-secondary hover:bg-bg-hover transition-colors"
+              aria-label={isMuted ? "Unmute" : "Mute"}
+            >
+              {isMuted || volume === 0 ? (
+                <VolumeX className="h-4 w-4" />
+              ) : (
+                <Volume2 className="h-4 w-4" />
+              )}
+            </button>
+              </>
             )}
-            aria-label="Loop"
-          >
-            <Repeat className="h-4 w-4" />
-          </button>
-
-          <button
-            onClick={handleSpeedCycle}
-            className="flex h-7 items-center justify-center rounded px-1.5 text-xs font-medium text-text-secondary hover:bg-bg-hover hover:text-text-primary transition-colors tabular-nums"
-            aria-label="Playback speed"
-          >
-            {playbackRate}x
-          </button>
-
-          <button
-            onClick={toggleMute}
-            className="flex h-7 w-7 items-center justify-center rounded text-text-tertiary hover:text-text-secondary hover:bg-bg-hover transition-colors"
-            aria-label={isMuted ? "Unmute" : "Mute"}
-          >
-            {isMuted || volume === 0 ? (
-              <VolumeX className="h-4 w-4" />
-            ) : (
-              <Volume2 className="h-4 w-4" />
-            )}
-          </button>
         </div>
 
         {/* Center: Timecode display with format picker */}
@@ -652,7 +811,7 @@ export function VideoPlayer({
             />
           </button>
           {timeFormatOpen && (
-            <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-50 w-48 rounded-xl border border-white/10 bg-[#2a2a30] shadow-2xl py-1.5 animate-in fade-in zoom-in-95 duration-100">
+            <div className="absolute bottom-full left-1/2 -translate-x-1/2 slide-in-from-left-1/2 mb-2 z-50 w-48 rounded-xl border border-white/10 bg-[#2a2a30] shadow-2xl py-1.5 animate-in fade-in zoom-in-95 duration-100">
               <div className="px-3 py-2 text-[11px] text-text-tertiary uppercase tracking-wider font-medium">
                 Time Format
               </div>
@@ -772,15 +931,90 @@ export function VideoPlayer({
               </span>
             </div>
           )}
-          {qualityLevels.length > 0 && (
+          {compact && (
+            <div className="relative" ref={overflowRef}>
+              <button
+                onClick={() => setOverflowOpen((p) => !p)}
+                className="flex h-11 w-11 items-center justify-center rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover transition-colors"
+                aria-label="More controls"
+                aria-expanded={overflowOpen}
+              >
+                <MoreHorizontal className="h-5 w-5" />
+              </button>
+              {overflowOpen && (
+                <div className="absolute bottom-full right-0 mb-2 z-50 w-44 rounded-xl border border-border bg-bg-elevated shadow-2xl py-1.5">
+                  {/* Quality lives here below sm rather than as an inline
+                      <select>: the select is ~69px wide, which the compact row
+                      has no room for at 360px, and its text-xs would trip
+                      iOS Safari's zoom-on-focus. Opening it replaces the rows
+                      rather than appending to them: the menu opens upward from
+                      a transport row that sits only ~190-245px below the top
+                      of the player on a portrait phone, and four rows (190px)
+                      is what fits there. Auto plus the ladder's at most three
+                      rungs is exactly four. */}
+                  {qualityListOpen ? (
+                    [{ index: -1, label: autoQualityLabel }, ...qualityLevels].map((level) => (
+                      <button
+                        key={level.index}
+                        onClick={() => { setQuality(level.index); setOverflowOpen(false); }}
+                        className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
+                        aria-label={`Quality ${level.label}`}
+                      >
+                        {level.label}
+                        {selectedQuality === level.index && <Check className="h-4 w-4 text-accent" />}
+                      </button>
+                    ))
+                  ) : (
+                    <>
+                      <button
+                        onClick={() => { setLoop((v) => !v); setOverflowOpen(false); }}
+                        className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
+                      >
+                        Loop
+                        {loop && <Check className="h-4 w-4 text-accent" />}
+                      </button>
+                      <button
+                        onClick={() => { handleSpeedCycle(); }}
+                        className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
+                      >
+                        Speed
+                        <span className="tabular-nums text-text-tertiary">{playbackRate}x</span>
+                      </button>
+                      <button
+                        onClick={() => { toggleMute(); setOverflowOpen(false); }}
+                        className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
+                      >
+                        {isMuted || volume === 0 ? 'Unmute' : 'Mute'}
+                        {isMuted || volume === 0 ? <VolumeX className="h-4 w-4" /> : <Volume2 className="h-4 w-4" />}
+                      </button>
+                      {qualityLevels.length > 0 && (
+                        <button
+                          onClick={() => setQualityListOpen(true)}
+                          className="flex h-11 w-full items-center justify-between px-3 text-[13px] text-text-secondary hover:bg-bg-hover transition-colors"
+                        >
+                          Quality
+                          <span className="flex items-center gap-1 text-text-tertiary">
+                            {selectedQualityLabel}
+                            <ChevronRight className="h-3 w-3" />
+                          </span>
+                        </button>
+                      )}
+                    </>
+                  )}
+                </div>
+              )}
+            </div>
+          )}
+          {/* Quality selector (in the overflow menu when compact) */}
+          {!compact && qualityLevels.length > 0 && (
             <select
-              value={currentQuality}
+              value={selectedQuality}
               onChange={(e) => setQuality(parseInt(e.target.value, 10))}
               className="bg-transparent text-text-secondary text-xs border border-border rounded px-1.5 py-1 cursor-pointer shrink-0 hover:text-text-primary transition-colors"
               aria-label="Quality"
             >
               <option value={-1} className="bg-bg-secondary">
-                Auto
+                {autoQualityLabel}
               </option>
               {qualityLevels.map((level) => (
                 <option
@@ -796,7 +1030,7 @@ export function VideoPlayer({
 
           <button
             onClick={handleFullscreen}
-            className="flex h-7 w-7 items-center justify-center rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover transition-colors"
+            className={cn("flex items-center justify-center rounded text-text-tertiary hover:text-text-primary hover:bg-bg-hover transition-colors", compact ? "h-11 w-11" : "h-7 w-7")}
             aria-label={isFullscreen ? "Exit fullscreen" : "Enter fullscreen"}
           >
             {isFullscreen ? (

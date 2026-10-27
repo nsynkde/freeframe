@@ -6,7 +6,8 @@ import { useAuthStore } from '@/stores/auth-store'
 import { api } from '@/lib/api'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
-import { Avatar } from '@/components/shared/avatar'
+import { ProfileAvatarEditor } from '@/components/settings/profile-avatar-editor'
+import { setTokens } from '@/lib/auth'
 
 export default function ProfilePage() {
   const { user, fetchUser } = useAuthStore()
@@ -70,10 +71,15 @@ export default function ProfilePage() {
 
     setIsSavingPassword(true)
     try {
-      await api.patch('/auth/change-password', {
+      const response = await api.patch('/auth/change-password', {
         current_password: currentPassword,
         new_password: newPassword,
-      })
+      }) as { access_token: string, refresh_token:string}
+
+      if (response.access_token && response.refresh_token) {
+        setTokens(response.access_token, response.refresh_token)
+      }
+
       setCurrentPassword('')
       setNewPassword('')
       setConfirmPassword('')
@@ -91,7 +97,7 @@ export default function ProfilePage() {
     <div className="p-6 max-w-xl space-y-8">
       <div className="flex items-center gap-3">
         <div className="flex h-10 w-10 items-center justify-center rounded-xl bg-accent-muted">
-          <User className="h-5 w-5 text-accent" />
+          <User className="h-5 w-5 text-text-primary" />
         </div>
         <div>
           <h1 className="text-lg font-semibold text-text-primary">Profile</h1>
@@ -107,15 +113,7 @@ export default function ProfilePage() {
           Profile
         </h2>
 
-        <div className="flex items-center gap-4">
-          <Avatar src={user?.avatar_url} name={user?.name} size="lg" />
-          <div>
-            <p className="text-sm font-medium text-text-primary">
-              {user?.name ?? 'Loading...'}
-            </p>
-            <p className="text-xs text-text-tertiary">{user?.email ?? ''}</p>
-          </div>
-        </div>
+        <ProfileAvatarEditor />
 
         <form onSubmit={handleProfileSave} className="space-y-4">
           <div className="space-y-1.5">

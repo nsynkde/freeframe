@@ -15,7 +15,7 @@ import type { AssetResponse, AssetVersion, Comment } from "@/types";
 
 // ─── Types ────────────────────────────────────────────────────────────────────
 
-interface CreateCommentPayload {
+export interface CreateCommentPayload {
   body: string;
   version_id?: string;
   parent_id?: string;
@@ -40,6 +40,10 @@ interface ReviewContextValue {
   refetchVersions: () => Promise<void>;
   pauseVideo: () => void;
   registerPauseHandler: (handler: () => void) => void;
+  /** The video player's own play/pause toggle, retry and all. No-op without a video player. */
+  togglePlayback: () => void;
+  /** Returns the unregister, which clears the handler only if it is still this one. */
+  registerTogglePlayHandler: (handler: () => void) => () => void;
 }
 
 // ─── Context ──────────────────────────────────────────────────────────────────
@@ -52,6 +56,8 @@ interface ReviewProviderProps {
   assetId: string;
   shareToken?: string; // If set, uses share token API instead of authenticated API
   shareSession?: string | null;
+  /** Version to open on instead of the newest, if it is ready. Read on mount only. */
+  initialVersionId?: string | null;
   children: React.ReactNode;
 }
 
@@ -59,6 +65,7 @@ export function ReviewProvider({
   assetId,
   shareToken,
   shareSession,
+  initialVersionId,
   children,
 }: ReviewProviderProps) {
   const [asset, setAsset] = useState<AssetResponse | null>(null);
@@ -67,12 +74,22 @@ export function ReviewProvider({
   const [isLoading, setIsLoading] = useState(true);
   const [error, setError] = useState<string | null>(null);
   const pauseHandlerRef = useRef<(() => void) | null>(null);
+  const togglePlayHandlerRef = useRef<(() => void) | null>(null);
 
-  const { setCurrentAsset, setCurrentVersion, setPlayheadTime } =
+  const { setCurrentAsset, setCurrentVersion, setPlayheadTime, currentVersion } =
     useReviewStore();
 
   // Track whether component is still mounted to avoid state updates after unmount
   const mountedRef = useRef(true);
+  // In share mode, remembers which version the current stream_url corresponds to,
+  // so switching versions refetches the stream but the initial load does not double-fetch.
+  const streamedVersionRef = useRef<string | null>(null);
+  // Guards against a stale comments fetch (e.g. an in-flight all-versions request)
+  // overwriting a newer version-scoped one — only the latest request applies its result.
+  const commentsReqRef = useRef(0);
+  // A compare link names its right pane, which is the current version (#299).
+  // Held from mount so a later URL change does not refetch the asset.
+  const initialVersionRef = useRef(initialVersionId ?? null);
   useEffect(() => {
     mountedRef.current = true;
     return () => {
@@ -149,16 +166,51 @@ export function ReviewProvider({
         if (!mountedRef.current) return;
         setVersions(allVersions ?? []);
 
-        const readyVersion = (allVersions ?? [])
+        const ready = (allVersions ?? [])
           .sort((a, b) => b.version_number - a.version_number)
-          .find((v) => v.processing_status === "ready");
+          .filter((v) => v.processing_status === "ready");
+        const readyVersion =
+          ready.find((v) => v.id === initialVersionRef.current) ?? ready[0];
         if (readyVersion) {
           setCurrentVersion(readyVersion);
         } else if (data.latest_version) {
           setCurrentVersion(data.latest_version);
         }
-      } else if (data.latest_version) {
-        setCurrentVersion(data.latest_version);
+      } else {
+        // Share mode: fetch the versions the guest may see (the server exposes all ready
+        // versions only when the link enables "Show all versions", else just the latest).
+        // The initial stream_url above already corresponds to the latest version.
+        streamedVersionRef.current = data.latest_version?.id ?? null;
+        const API_URL =
+          process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+        const headers: Record<string, string> = {};
+        try {
+          const t = localStorage.getItem("ff_access_token");
+          if (t) headers["Authorization"] = `Bearer ${t}`;
+        } catch {}
+        try {
+          const vres = await fetch(
+            `${API_URL}/share/${shareToken}/assets/${assetId}/versions?_=1${shareSessionParam}`,
+            { headers },
+          );
+          const vlist = vres.ok ? await vres.json() : [];
+          if (!mountedRef.current) return;
+          const mapped = ((vlist as any[]) ?? []).map((v) => ({
+            id: v.id,
+            asset_id: assetId,
+            version_number: v.version_number,
+            processing_status: v.processing_status,
+            created_by: "",
+            created_at: v.created_at,
+            deleted_at: null,
+            files: [],
+          })) as AssetVersion[];
+          setVersions(mapped);
+          if (mapped.length > 0) setCurrentVersion(mapped[0]);
+          else if (data.latest_version) setCurrentVersion(data.latest_version);
+        } catch {
+          if (data.latest_version) setCurrentVersion(data.latest_version);
+        }
       }
     } catch (err) {
       if (!mountedRef.current) return;
@@ -167,13 +219,18 @@ export function ReviewProvider({
   }, [assetId, shareToken, shareSessionParam, setCurrentAsset, setCurrentVersion]);
 
   const fetchComments = useCallback(async () => {
+    const reqId = ++commentsReqRef.current;
     try {
       let data: Comment[];
       if (shareToken) {
         const API_URL =
           process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+        // Scope comments to the version currently being viewed (read non-reactively so
+        // this callback stays stable; a dedicated effect re-runs it when the version changes).
+        const versionId = useReviewStore.getState().currentVersion?.id;
+        const vParam = versionId ? `&version_id=${versionId}` : "";
         const res = await fetch(
-          `${API_URL}/share/${shareToken}/comments?asset_id=${assetId}${shareSessionParam}`,
+          `${API_URL}/share/${shareToken}/comments?asset_id=${assetId}${vParam}${shareSessionParam}`,
         );
         if (res.ok) {
           const json = await res.json();
@@ -185,7 +242,7 @@ export function ReviewProvider({
       } else {
         data = await api.get<Comment[]>(`/assets/${assetId}/comments`);
       }
-      if (!mountedRef.current) return;
+      if (!mountedRef.current || reqId !== commentsReqRef.current) return;
       setComments(data ?? []);
     } catch {
       // Comments failing silently — asset is still viewable
@@ -210,10 +267,54 @@ export function ReviewProvider({
   useEffect(() => {
     setIsLoading(true);
     setError(null);
-    Promise.all([fetchAsset(), fetchComments()]).finally(() => {
+    // In share mode, comments are version-scoped and fetched by the effect below once
+    // the version is known — so the first (and only) comments request is already scoped
+    // to the viewed version, avoiding an all-versions flash on open.
+    const commentsPromise = shareToken ? Promise.resolve() : fetchComments();
+    Promise.all([fetchAsset(), commentsPromise]).finally(() => {
       if (mountedRef.current) setIsLoading(false);
     });
-  }, [fetchAsset, fetchComments]);
+  }, [fetchAsset, fetchComments, shareToken]);
+
+  // Share mode: (re)scope comments to the selected version — but only once a version is
+  // known, so we never fetch the unfiltered all-versions list.
+  const currentVersionId = currentVersion?.id;
+  useEffect(() => {
+    if (!shareToken || !currentVersionId) return;
+    fetchComments();
+    // fetchComments reads the current version via getState, so it is intentionally
+    // not a dependency here — currentVersionId is the trigger.
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [shareToken, currentVersionId]);
+
+  // Share mode: swap the video stream to the selected version's media when it changes.
+  useEffect(() => {
+    if (!shareToken || !currentVersionId) return;
+    if (currentVersionId === streamedVersionRef.current) return; // already showing this version
+    let cancelled = false;
+    const API_URL = process.env.NEXT_PUBLIC_API_URL || "http://localhost:8000";
+    const headers: Record<string, string> = {};
+    try {
+      const t = localStorage.getItem("ff_access_token");
+      if (t) headers["Authorization"] = `Bearer ${t}`;
+    } catch {}
+    fetch(
+      `${API_URL}/share/${shareToken}/stream/${assetId}?version_id=${currentVersionId}${shareSessionParam}`,
+      { headers },
+    )
+      .then((r) => (r.ok ? r.json() : null))
+      .then((streamData) => {
+        if (cancelled || !mountedRef.current || !streamData?.url) return;
+        streamedVersionRef.current = currentVersionId;
+        setAsset((prev) =>
+          prev ? ({ ...prev, stream_url: streamData.url } as AssetResponse) : prev,
+        );
+      })
+      .catch(() => {});
+    return () => {
+      cancelled = true;
+    };
+  }, [shareToken, assetId, currentVersionId, shareSessionParam]);
 
   const addComment = useCallback(
     async (payload: CreateCommentPayload): Promise<Comment> => {
@@ -243,7 +344,17 @@ export function ReviewProvider({
           headers,
           body: JSON.stringify({ ...payload, ...guestFields, asset_id: assetId }),
         });
-        if (!res.ok) throw new Error("Failed to post comment");
+        if (!res.ok) {
+          // Surface the server's reason (e.g. "Parent comment not found on this
+          // asset") so a failed reply can say why. A 422's `detail` is a list,
+          // and a proxy error may have no JSON body: both fall back.
+          let detail = "";
+          try {
+            const data = await res.json();
+            if (typeof data?.detail === "string") detail = data.detail;
+          } catch {}
+          throw new Error(detail || "Failed to post comment");
+        }
         comment = await res.json();
       } else {
         comment = await api.post<Comment>(
@@ -288,6 +399,21 @@ export function ReviewProvider({
     pauseHandlerRef.current = handler;
   }, []);
 
+  const togglePlayback = useCallback(() => {
+    togglePlayHandlerRef.current?.();
+  }, []);
+
+  // Cleared on unregister, unlike the pause handler: the mobile sheet's
+  // transport calls this for whatever player is mounted, and a video player
+  // replaced by an audio one must not leave its toggle behind. Only its own,
+  // though, so a late unregister never clears a newer player's toggle.
+  const registerTogglePlayHandler = useCallback((handler: () => void) => {
+    togglePlayHandlerRef.current = handler;
+    return () => {
+      if (togglePlayHandlerRef.current === handler) togglePlayHandlerRef.current = null;
+    };
+  }, []);
+
   const value = useMemo<ReviewContextValue>(
     () => ({
       assetId,
@@ -305,6 +431,8 @@ export function ReviewProvider({
       refetchVersions,
       pauseVideo,
       registerPauseHandler,
+      togglePlayback,
+      registerTogglePlayHandler,
     }),
     [
       assetId,
@@ -320,6 +448,8 @@ export function ReviewProvider({
       refetchVersions,
       pauseVideo,
       registerPauseHandler,
+      togglePlayback,
+      registerTogglePlayHandler,
     ],
   );
 

@@ -6,7 +6,7 @@
 import uuid
 from unittest.mock import MagicMock, patch
 
-from jose import jwt
+import jwt
 
 from apps.api.config import settings
 
@@ -147,7 +147,7 @@ def test_validate_share_link_image_does_not_append_master_m3u8(
     )
 
 
-@patch("apps.api.routers.share._validate_asset_in_share")
+@patch("apps.api.routers.share.validate_asset_in_share")
 @patch("apps.api.routers.share._log_share_activity")
 @patch("apps.api.routers.share._get_latest_media_file")
 @patch("apps.api.routers.share._get_asset")

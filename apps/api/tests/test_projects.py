@@ -29,6 +29,7 @@ def _mock_project(
     p.is_public = False
     p.poster_url = None
     p.poster_s3_key = None
+    p.slack_webhook_url = None
     p.asset_count = 0
     p.storage_bytes = 0
     p.member_count = 1

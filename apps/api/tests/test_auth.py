@@ -9,8 +9,10 @@ a bcrypt version that is incompatible with passlib. The hash/verify logic is
 unit-tested separately in test_auth_service.py.
 """
 import uuid
-from datetime import datetime, timezone
+from datetime import datetime, timezone, timedelta
 from unittest.mock import MagicMock, patch
+
+import pytest
 
 from apps.api.models.user import UserStatus
 
@@ -29,55 +31,15 @@ def _mock_user(
     u.password_hash = password_hash
     u.status = UserStatus.active
     u.avatar_url = None
+    u.avatar_color = None
+    u.token_version = 1
     u.created_at = datetime.now(timezone.utc)
     u.deleted_at = None
     return u
 
 
-# Patch bcrypt hashing so tests don't depend on the local bcrypt installation.
-_HASH_PATCH = "apps.api.routers.auth.hash_password"
+# Patch bcrypt verification so tests don't depend on the local bcrypt installation.
 _VERIFY_PATCH = "apps.api.routers.auth.verify_password"
-
-
-def test_register_success(client, mock_db):
-    """POST /auth/register — happy path creates a user and returns 201."""
-    mock_db.first.return_value = None  # no duplicate email
-
-    def _refresh_side_effect(obj):
-        obj.id = uuid.uuid4()
-        obj.created_at = datetime.now(timezone.utc)
-        obj.deleted_at = None
-        obj.avatar_url = None
-        obj.status = UserStatus.active
-        obj.is_superadmin = False
-        obj.email_verified = False
-        obj.preferences = {}
-        obj.invite_token = None
-
-    mock_db.refresh.side_effect = _refresh_side_effect
-
-    with patch(_HASH_PATCH, return_value=_FAKE_HASH):
-        resp = client.post(
-            "/auth/register",
-            json={"email": "newuser@example.com", "name": "New User", "password": "securepassword"},
-        )
-
-    assert resp.status_code == 201
-    assert resp.json()["email"] == "newuser@example.com"
-
-
-def test_register_duplicate_email(client, mock_db):
-    """POST /auth/register — returns 400 when email already exists."""
-    existing = _mock_user("dup@example.com")
-    mock_db.first.return_value = existing
-
-    with patch(_HASH_PATCH, return_value=_FAKE_HASH):
-        resp = client.post(
-            "/auth/register",
-            json={"email": "dup@example.com", "name": "A", "password": "pw123456"},
-        )
-
-    assert resp.status_code == 400
 
 
 def test_login_success(client, mock_db):
@@ -105,7 +67,7 @@ def test_login_wrong_password(client, mock_db):
     with patch(_VERIFY_PATCH, return_value=False):
         resp = client.post(
             "/auth/login",
-            json={"email": "wp@example.com", "password": "wrong"},
+            json={"email": "wp@example.com", "password": "wrongpass"},
         )
 
     assert resp.status_code == 401
@@ -120,6 +82,137 @@ def test_login_nonexistent_user(client, mock_db):
         json={"email": "nobody@example.com", "password": "anypassword"},
     )
     assert resp.status_code == 401
+
+
+def test_send_magic_code_unknown_email_does_not_create_user(client, mock_db):
+    """POST /auth/send-magic-code — unknown email gets a generic response; no account is created.
+
+    Regression test: this endpoint used to auto-create and later auto-activate an account for
+    any email, bypassing the /users/invite gate entirely (GHSA-9m78-fww2-p89h).
+    """
+    mock_db.first.return_value = None  # no existing (i.e. no invited) user for this email
+
+    with patch("apps.api.middleware.rate_limit.check_rate_limit", return_value=(True, 0)):
+        resp = client.post("/auth/send-magic-code", json={"email": "uninvited@example.com"})
+
+    assert resp.status_code == 200
+    assert resp.json()["email"] == "uninvited@example.com"
+    mock_db.add.assert_not_called()
+    mock_db.commit.assert_not_called()
+
+
+def test_send_magic_code_existing_user_sends_code(client, mock_db):
+    """POST /auth/send-magic-code — an existing (e.g. already-invited) user gets a real code issued."""
+    user = _mock_user("invited@example.com")
+    mock_db.first.return_value = user
+
+    with patch("apps.api.middleware.rate_limit.check_rate_limit", return_value=(True, 0)), \
+         patch("apps.api.routers.auth.store_magic_code") as mock_store, \
+         patch("apps.api.routers.auth.send_task_safe") as mock_send:
+        resp = client.post("/auth/send-magic-code", json={"email": "invited@example.com"})
+
+    assert resp.status_code == 200
+    mock_store.assert_called_once()
+    mock_send.assert_called_once()
+
+
+def test_register_endpoint_removed(client):
+    """POST /auth/register — endpoint has been removed (was an unauthenticated, un-invite-gated
+    account creation path; GHSA-9m78-fww2-p89h). 404, not 405: the route no longer exists."""
+    resp = client.post(
+        "/auth/register",
+        json={"email": "newuser@example.com", "name": "New User", "password": "securepassword"},
+    )
+    assert resp.status_code == 404
+
+
+def test_users_batch_does_not_leak_invite_token(client, auth_headers, mock_db, test_user):
+    """GET /users — never includes invite_token, even for a caller with no admin rights.
+
+    Regression test: GET /users and GET /users/search reused UserResponse (which included
+    invite_token) behind only get_current_user, so any authenticated user could read a
+    pending invitee's live token and hijack the invite via /auth/accept-invite before the
+    real invitee acted (GHSA-9m78-fww2-p89h).
+    """
+    test_user.is_superadmin = False
+    target = _mock_user("invitee@example.com")
+    target.status = UserStatus.pending_invite
+    target.is_superadmin = False
+    target.email_verified = False
+    target.preferences = {}
+    target.invite_token = "super-secret-invite-token"
+    mock_db.all.return_value = [target]
+
+    resp = client.get(f"/users?ids={target.id}", headers=auth_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert len(body) == 1
+    assert "invite_token" not in body[0]
+
+
+def test_admin_list_users_still_includes_invite_token(client, auth_headers, mock_db, test_user):
+    """GET /admin/users — admin-gated, so it may still expose invite_token (needed for the
+    admin "copy invite link" UI); this endpoint's own is_superadmin check is the gate."""
+    test_user.is_superadmin = True
+    target = _mock_user("invitee@example.com")
+    target.status = UserStatus.pending_invite
+    target.is_superadmin = False
+    target.email_verified = False
+    target.preferences = {}
+    target.invite_token = "super-secret-invite-token"
+    mock_db.all.return_value = [target]
+
+    resp = client.get("/admin/users", headers=auth_headers)
+
+    assert resp.status_code == 200
+    body = resp.json()
+    assert body[0]["invite_token"] == "super-secret-invite-token"
+
+
+def test_verify_magic_code_unknown_user_generic_401(client, mock_db):
+    """POST /auth/verify-magic-code — an unregistered email gets the same generic failure as a
+    wrong code (401), not a distinguishing 404. Otherwise the endpoint lets a caller enumerate
+    which emails are registered."""
+    mock_db.first.return_value = None
+
+    with patch("apps.api.middleware.rate_limit.check_rate_limit", return_value=(True, 0)):
+        resp = client.post("/auth/verify-magic-code", json={"email": "nobody@example.com", "code": "000000"})
+
+    assert resp.status_code == 401
+
+
+def test_verify_magic_code_deactivated_user_generic_401(client, mock_db):
+    """POST /auth/verify-magic-code — a deactivated account gets the same generic 401 as an
+    unregistered email or a wrong code, not a distinguishing "Account deactivated" message."""
+    user = _mock_user("deactivated@example.com")
+    user.status = UserStatus.deactivated
+    mock_db.first.return_value = user
+
+    with patch("apps.api.middleware.rate_limit.check_rate_limit", return_value=(True, 0)):
+        resp = client.post("/auth/verify-magic-code", json={"email": "deactivated@example.com", "code": "000000"})
+
+    assert resp.status_code == 401
+    # Compared against the shared constant so the two raise sites can't drift
+    # apart into distinguishable messages.
+    from apps.api.routers.auth import MAGIC_CODE_FAILURE_DETAIL
+    assert resp.json()["detail"] == MAGIC_CODE_FAILURE_DETAIL
+
+
+def test_verify_magic_code_success(client, mock_db):
+    """POST /auth/verify-magic-code — correct code for an active user returns tokens."""
+    user = _mock_user("verify@example.com")
+    user.status = UserStatus.active
+    mock_db.first.return_value = user
+
+    with patch("apps.api.middleware.rate_limit.check_rate_limit", return_value=(True, 0)), \
+         patch("apps.api.routers.auth.redis_verify_magic_code", return_value=(True, "")):
+        resp = client.post("/auth/verify-magic-code", json={"email": "verify@example.com", "code": "123456"})
+
+    assert resp.status_code == 200
+    data = resp.json()
+    assert "access_token" in data
+    assert "refresh_token" in data
 
 
 def test_get_me(client, auth_headers, test_user):
@@ -152,3 +245,672 @@ def test_get_me_no_auth(client):
     """GET /auth/me without token should return 401 or 403 (no bearer scheme)."""
     resp = client.get("/auth/me")
     assert resp.status_code in (401, 403)
+
+
+def test_change_password_invalid_length(client, auth_headers):
+    """Test that passwords under 8 characters are rejected by Pydantic."""
+    payload = {
+        "current_password": "ValidPassword123!",
+        "new_password": "short" # 5 characters
+    }
+    
+    response = client.patch("/auth/change-password", json=payload, headers=auth_headers)
+    
+    assert response.status_code == 422
+    assert "new_password" in response.text
+
+def test_refresh_token_rejected_after_password_change(client, mock_db):
+    """Test that an old refresh token is rejected if the token_version has incremented."""
+    from apps.api.services.auth_service import create_refresh_token
+    
+    # 1. Use the file's mock helper, but simulate a password change by bumping the version to 2
+    mock_user = _mock_user("test@example.com")
+    mock_user.token_version = 2 
+    
+    # Configure the mock_db to return this user
+    mock_db.first.return_value = mock_user
+
+    # 2. Create a "stolen" refresh token that was minted when the version was 1
+    stolen_token = create_refresh_token(str(mock_user.id), token_version=1)
+
+    # 3. Attempt to refresh the session
+    response = client.post("/auth/refresh", json={"refresh_token": stolen_token})
+    
+    # 4. Assert the request is blocked
+    assert response.status_code == 401
+    assert response.json()["detail"] == "Session expired, please log in again"
+
+def test_refresh_token_legacy_token_accepted(client, mock_db):
+    """Test that a token without a 'ver' claim is treated as version 1 and accepted."""
+    from apps.api.config import settings
+    import jwt
+    
+    mock_user = _mock_user("legacy@example.com")
+    mock_user.token_version = 1
+    mock_db.first.return_value = mock_user
+    
+    # Manually mint a JWT that completely lacks the "ver" claim
+    expire = datetime.now(timezone.utc) + timedelta(days=7)
+    legacy_token = jwt.encode({"sub": str(mock_user.id), "type": "refresh", "exp": expire}, settings.jwt_secret, algorithm=settings.jwt_algorithm)
+    
+    response = client.post("/auth/refresh", json={"refresh_token": legacy_token})
+    assert response.status_code == 200
+    assert "access_token" in response.json()
+
+def test_change_password_increments_version(client, auth_headers, test_user, mock_db):
+    """Test that changing password bumps token_version and returns fresh tokens."""
+    
+    # Explicitly set the token_version so the endpoint doesn't crash on `None += 1`
+    test_user.token_version = 1
+    mock_db.commit()
+    mock_db.refresh(test_user)
+    
+    initial_version = test_user.token_version
+    
+    with patch("apps.api.routers.auth.verify_password", return_value=True), \
+         patch("apps.api.routers.auth.hash_password", return_value=_FAKE_HASH):
+        
+        payload = {
+            "current_password": "AnyOldPassword123!",
+            "new_password": "NewValidPassword123!"
+        }
+        response = client.patch("/auth/change-password", json=payload, headers=auth_headers)
+
+        assert response.status_code == 200
+        data = response.json()
+        assert "access_token" in data
+        assert "refresh_token" in data
+
+        mock_db.refresh(test_user)
+        assert test_user.token_version == initial_version + 1
+
+
+def test_delete_user_rejects_self(client, auth_headers, test_user):
+    """DELETE /users/{id} — an admin can't delete their own account. Matches the
+    self-protection already on /admin/users/{id}/deactivate; without it, a superadmin
+    (accidentally or via a compromised session) could lock themselves out irrecoverably,
+    since /setup/create-superadmin only checks is_superadmin, not soft-deletion."""
+    test_user.is_superadmin = True
+    resp = client.delete(f"/users/{test_user.id}", headers=auth_headers)
+    assert resp.status_code == 400
+
+
+def test_delete_user_rejects_active_user(client, auth_headers, mock_db, test_user):
+    """DELETE /users/{id} — only a deactivated user can be deleted. The admin UI only
+    offers Delete after deactivation; the API enforces the same order."""
+    test_user.is_superadmin = True
+    target = _mock_user("active@example.com")
+    mock_db.first.return_value = target
+
+    resp = client.delete(f"/users/{target.id}", headers=auth_headers)
+
+    assert resp.status_code == 409
+    assert target.deleted_at is None
+    mock_db.commit.assert_not_called()
+
+
+def test_delete_user_soft_deletes_deactivated_user(client, auth_headers, mock_db, test_user):
+    """DELETE /users/{id} — a deactivated user is soft-deleted, not removed."""
+    test_user.is_superadmin = True
+    target = _mock_user("gone@example.com")
+    target.status = UserStatus.deactivated
+    mock_db.first.return_value = target
+
+    resp = client.delete(f"/users/{target.id}", headers=auth_headers)
+
+    assert resp.status_code == 204
+    assert target.deleted_at is not None
+    mock_db.delete.assert_not_called()
+
+
+def test_invite_rejects_deleted_users_email(client, auth_headers, mock_db, test_user):
+    """POST /users/invite — an email that belonged to a deleted user gets a clear 400.
+
+    Deletion only sets deleted_at, and the unique constraint on users.email still
+    covers that row. The old existence check skipped soft-deleted rows, so the
+    INSERT hit the constraint and the admin saw a 500.
+    """
+    test_user.is_superadmin = True
+    deleted = _mock_user("former@example.com")
+    deleted.deleted_at = datetime.now(timezone.utc)
+    mock_db.order_by.return_value = mock_db
+    mock_db.first.return_value = deleted
+
+    resp = client.post(
+        "/users/invite",
+        json={"email": "former@example.com", "name": "former"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "This email belonged to a deleted user and can't be invited again"
+    mock_db.add.assert_not_called()
+    # The lookup must include soft-deleted rows, or the INSERT trips users_email_key.
+    criteria = " ".join(str(c) for c in mock_db.filter.call_args.args)
+    assert "deleted_at" not in criteria
+
+
+def test_invite_rejects_existing_active_email(client, auth_headers, mock_db, test_user):
+    """POST /users/invite — a live account keeps the "already registered" message,
+    which the Bulk Invite dialog relies on to count the address as skipped."""
+    test_user.is_superadmin = True
+    mock_db.order_by.return_value = mock_db
+    mock_db.first.return_value = _mock_user("taken@example.com")
+
+    resp = client.post(
+        "/users/invite",
+        json={"email": "taken@example.com", "name": "taken"},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "Email already registered"
+    mock_db.add.assert_not_called()
+
+
+def _pending_invitee(token: str = "invite-token-1") -> MagicMock:
+    """A user mid-invite: name derived from the email, no password yet."""
+    u = _mock_user("patrick.rosen@example.com")
+    u.name = "patrick.rosen"  # what the Bulk Invite dialog fills in
+    u.status = UserStatus.pending_invite
+    u.email_verified = False
+    u.password_hash = None
+    u.invite_token = token
+    u.invite_token_expires_at = None
+    return u
+
+
+def test_accept_invite_stores_the_name_the_invitee_typed(client, mock_db):
+    """POST /auth/accept-invite — the name on the accept screen reaches the user.
+
+    Issue #320: the screen asked for a full name, validated it and sent it, and
+    AcceptInviteRequest did not declare the field — so pydantic's default
+    extra="ignore" dropped it silently and the invitee kept the local part of
+    their email address as a display name, on their profile, the members list
+    and every comment.
+    """
+    user = _pending_invitee()
+    mock_db.first.return_value = user
+
+    resp = client.post(
+        "/auth/accept-invite",
+        json={"token": "invite-token-1", "password": "securepassword", "name": "Patrick Rosen"},
+    )
+
+    assert resp.status_code == 200
+    assert user.name == "Patrick Rosen", "the typed name is stored, not the one derived from the email"
+
+
+def test_accept_invite_trims_the_name(client, mock_db):
+    """Surrounding whitespace is not part of a display name."""
+    user = _pending_invitee()
+    mock_db.first.return_value = user
+
+    resp = client.post(
+        "/auth/accept-invite",
+        json={"token": "invite-token-1", "password": "securepassword", "name": "  Patrick Rosen  "},
+    )
+
+    assert resp.status_code == 200
+    assert user.name == "Patrick Rosen"
+
+
+def test_accept_invite_rejects_a_blank_name(client, mock_db):
+    """A name of only whitespace is refused rather than stored empty.
+
+    `min_length=1` counts characters, so "   " satisfies it and then strips to
+    "" — which User.name accepts, being String(255) and nullable=False, and
+    which renders as a blank author on every comment. The frontend already
+    rejects it (`if (!name.trim())`); this is the same rule where it is enforced.
+    """
+    user = _pending_invitee()
+    mock_db.first.return_value = user
+
+    resp = client.post(
+        "/auth/accept-invite",
+        json={"token": "invite-token-1", "password": "securepassword", "name": "   "},
+    )
+
+    assert resp.status_code == 422
+    assert user.name == "patrick.rosen", "a rejected request changes nothing"
+
+
+def test_accept_invite_requires_a_name(client, mock_db):
+    """The field is required, so an omission is refused rather than ignored.
+
+    Documenting the contract change: the only caller has always sent this, and a
+    silently-ignored field is the defect being fixed — a 422 says so where the
+    old behaviour said nothing at all.
+    """
+    user = _pending_invitee()
+    mock_db.first.return_value = user
+
+    resp = client.post(
+        "/auth/accept-invite",
+        json={"token": "invite-token-1", "password": "securepassword"},
+    )
+
+    assert resp.status_code == 422
+    assert user.name == "patrick.rosen"
+
+
+def test_accept_invite_still_sets_password_and_activates(client, mock_db):
+    """The control: adding the name must not disturb what accept-invite already did."""
+    user = _pending_invitee()
+    mock_db.first.return_value = user
+
+    resp = client.post(
+        "/auth/accept-invite",
+        json={"token": "invite-token-1", "password": "securepassword", "name": "Patrick Rosen"},
+    )
+
+    assert resp.status_code == 200
+    assert user.password_hash is not None
+    assert user.email_verified is True
+    assert user.status == UserStatus.active
+    assert user.invite_token is None
+    assert user.invite_token_expires_at is None
+
+
+def _deactivated_invitee() -> MagicMock:
+    """A pending invitee an admin deactivated while the link was still live,
+    as rows deactivated before the token was cleared on deactivation still are."""
+    u = _pending_invitee()
+    u.status = UserStatus.deactivated
+    u.invite_token_expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    return u
+
+
+def test_accept_invite_refuses_a_deactivated_invitee(client, mock_db):
+    """POST /auth/accept-invite — deactivating an invitee withdraws the invite.
+
+    Issue #472: the lookup matched only the token and deleted_at, then set
+    status=active, so a deactivated invitee walked straight past the
+    deactivation with a fresh pair of tokens. The 404 is the same one an unknown
+    token gets, so the response says nothing about the account.
+    """
+    user = _deactivated_invitee()
+    mock_db.first.return_value = user
+
+    resp = client.post(
+        "/auth/accept-invite",
+        json={"token": "invite-token-1", "password": "securepassword", "name": "Patrick Rosen"},
+    )
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Invalid invite link"
+    assert user.status == UserStatus.deactivated
+    assert user.password_hash is None
+    mock_db.commit.assert_not_called()
+
+
+def test_invite_info_refuses_a_deactivated_invitee(client, mock_db):
+    """GET /auth/invite/{token} — the set-password screen doesn't load for a
+    deactivated invitee either (#472)."""
+    mock_db.first.return_value = _deactivated_invitee()
+
+    resp = client.get("/auth/invite/invite-token-1")
+
+    assert resp.status_code == 404
+    assert resp.json()["detail"] == "Invalid invite link"
+
+
+def test_deactivate_clears_a_pending_invite_token(client, auth_headers, mock_db, test_user):
+    """PATCH /admin/users/{id}/deactivate — the invite link dies with the
+    deactivation, so a later Reactivate doesn't bring a live link back (#472)."""
+    test_user.is_superadmin = True
+    target = _pending_invitee()
+    target.invite_token_expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    target.is_superadmin = False
+    target.preferences = {}
+    mock_db.first.return_value = target
+
+    resp = client.patch(f"/admin/users/{target.id}/deactivate", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert target.status == UserStatus.deactivated
+    assert target.invite_token is None
+    assert target.invite_token_expires_at is None
+
+
+def test_delete_user_revokes_a_pending_invite(client, auth_headers, mock_db, test_user):
+    """DELETE /users/{id} — a pending invitee can be deleted without deactivating
+    first, which is how the admin page revokes an invite (#472). Still a soft
+    delete, and the token is cleared too. (What actually refuses the link once
+    the row is deleted is accept-invite's deleted_at filter, which a mocked
+    query can't exercise.)"""
+    test_user.is_superadmin = True
+    target = _pending_invitee()
+    target.invite_token_expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    mock_db.first.return_value = target
+
+    resp = client.delete(f"/users/{target.id}", headers=auth_headers)
+
+    assert resp.status_code == 204
+    assert target.deleted_at is not None
+    assert target.invite_token is None
+    assert target.invite_token_expires_at is None
+    mock_db.delete.assert_not_called()
+
+
+def test_resend_invite_issues_a_fresh_link_and_emails_it(client, auth_headers, mock_db, test_user):
+    """POST /users/{id}/resend-invite — a new 7-day link replaces the old one,
+    so the old link stops working, and the invite email goes out with it."""
+    test_user.is_superadmin = True
+    target = _pending_invitee(token="old-token")
+    target.invite_token_expires_at = datetime.now(timezone.utc) - timedelta(days=1)
+    target.is_superadmin = False
+    target.preferences = {}
+    mock_db.first.return_value = target
+
+    with patch("apps.api.routers.users.send_task_safe") as mock_send:
+        resp = client.post(f"/users/{target.id}/resend-invite", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert target.invite_token not in (None, "old-token")
+    remaining = target.invite_token_expires_at - datetime.now(timezone.utc)
+    assert timedelta(days=6, hours=23) < remaining <= timedelta(days=7)
+    assert target.status == UserStatus.pending_invite
+    mock_send.assert_called_once()
+    args = mock_send.call_args.args
+    assert args[1] == target.email
+    assert args[-1].endswith(f"/invite/{target.invite_token}")
+
+
+@pytest.mark.parametrize("state", ["active", "signed_in_pending", "deactivated"])
+def test_resend_invite_refuses_anyone_but_a_pending_invitee(client, auth_headers, mock_db, test_user, state):
+    """Only an invite nobody has accepted can be resent. An active or
+    deactivated account, or a pending row whose owner already signed in with a
+    code on an earlier release, gets 409 and no email."""
+    test_user.is_superadmin = True
+    target = _pending_invitee(token="tok")
+    if state == "active":
+        target.status = UserStatus.active
+    elif state == "deactivated":
+        target.status = UserStatus.deactivated
+    else:
+        target.email_verified = True
+    mock_db.first.return_value = target
+
+    with patch("apps.api.routers.users.send_task_safe") as mock_send:
+        resp = client.post(f"/users/{target.id}/resend-invite", headers=auth_headers)
+
+    assert resp.status_code == 409
+    assert target.invite_token == "tok"
+    mock_send.assert_not_called()
+
+
+def test_resend_invite_unknown_user_404(client, auth_headers, mock_db, test_user):
+    test_user.is_superadmin = True
+    mock_db.first.return_value = None
+
+    with patch("apps.api.routers.users.send_task_safe") as mock_send:
+        resp = client.post(f"/users/{uuid.uuid4()}/resend-invite", headers=auth_headers)
+
+    assert resp.status_code == 404
+    mock_send.assert_not_called()
+
+
+def test_resend_invite_needs_an_admin(client, auth_headers, mock_db, test_user):
+    test_user.is_superadmin = False
+    mock_db.first.return_value = _pending_invitee()
+
+    with patch("apps.api.routers.users.send_task_safe") as mock_send:
+        resp = client.post(f"/users/{uuid.uuid4()}/resend-invite", headers=auth_headers)
+
+    assert resp.status_code == 403
+    mock_send.assert_not_called()
+
+
+def test_verify_magic_code_sends_a_pending_invitee_to_their_invite(client, mock_db):
+    """POST /auth/verify-magic-code — a code does not sign in a pending invitee.
+
+    An invite is accepted on the invite screen and nowhere else. Before, an
+    invitee who used the login page instead got tokens and used the app while
+    the row stayed pending_invite, so Revoke Invite soft-deleted a working
+    account (#472). The row is left exactly as the invite made it.
+    """
+    user = _pending_invitee()
+    expires = datetime.now(timezone.utc) + timedelta(days=7)
+    user.invite_token_expires_at = expires
+    mock_db.first.return_value = user
+
+    with patch("apps.api.middleware.rate_limit.check_rate_limit", return_value=(True, 0)), \
+         patch("apps.api.routers.auth.redis_verify_magic_code", return_value=(True, "")):
+        resp = client.post("/auth/verify-magic-code", json={"email": user.email, "code": "123456"})
+
+    from apps.api.routers.auth import INVITE_NOT_ACCEPTED_DETAIL
+    assert resp.status_code == 403
+    assert resp.json()["detail"] == INVITE_NOT_ACCEPTED_DETAIL
+    assert "access_token" not in resp.json()
+    assert user.status == UserStatus.pending_invite
+    assert user.email_verified is False
+    assert user.invite_token == "invite-token-1"
+    assert user.invite_token_expires_at == expires
+
+
+def test_verify_magic_code_checks_the_code_before_naming_an_invite(client, mock_db):
+    """A wrong code for a pending invitee gets the generic failure, so the
+    invite message never tells someone without the mailbox that an invite exists."""
+    user = _pending_invitee()
+    mock_db.first.return_value = user
+
+    with patch("apps.api.middleware.rate_limit.check_rate_limit", return_value=(True, 0)), \
+         patch("apps.api.routers.auth.redis_verify_magic_code", return_value=(False, "Invalid code")):
+        resp = client.post("/auth/verify-magic-code", json={"email": user.email, "code": "000000"})
+
+    from apps.api.routers.auth import MAGIC_CODE_FAILURE_DETAIL
+    assert resp.status_code == 401
+    assert resp.json()["detail"] == MAGIC_CODE_FAILURE_DETAIL
+    assert user.status == UserStatus.pending_invite
+
+
+def test_verify_magic_code_still_signs_in_an_invitee_who_already_uses_the_app(client, mock_db):
+    """POST /auth/verify-magic-code — a pending row with a verified email is an
+    invitee an earlier release let in by code without accepting: a working
+    account. Refusing them would lock them out once their session ends, with no
+    invite to resend or revoke (#472). Only an invitee who never signed in is
+    sent to their invite link."""
+    user = _pending_invitee()
+    user.email_verified = True
+    user.password_hash = None
+    mock_db.first.return_value = user
+
+    with patch("apps.api.middleware.rate_limit.check_rate_limit", return_value=(True, 0)), \
+         patch("apps.api.routers.auth.redis_verify_magic_code", return_value=(True, "")):
+        resp = client.post("/auth/verify-magic-code", json={"email": user.email, "code": "123456"})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["access_token"]
+
+
+def test_delete_user_refuses_an_invitee_who_signed_in(client, auth_headers, mock_db, test_user):
+    """DELETE /users/{id} — a row still marked pending_invite whose owner signed
+    in with a code (email_verified, from when a code still let a pending invitee
+    in) is a working account, so it needs deactivating first like any other (#472)."""
+    test_user.is_superadmin = True
+    target = _pending_invitee()
+    target.email_verified = True
+    mock_db.first.return_value = target
+
+    resp = client.delete(f"/users/{target.id}", headers=auth_headers)
+
+    assert resp.status_code == 409
+    assert target.deleted_at is None
+    mock_db.commit.assert_not_called()
+
+
+def test_reactivate_restores_a_never_accepted_invite(client, auth_headers, mock_db, test_user):
+    """PATCH /admin/users/{id}/reactivate — an invitee who never accepted goes
+    back to pending with a fresh 7-day link. Deactivating cleared the old one,
+    so coming back as active would leave an account with no password and no
+    link to set one (#472)."""
+    test_user.is_superadmin = True
+    target = _pending_invitee()
+    target.status = UserStatus.deactivated
+    target.invite_token = None
+    target.is_superadmin = False
+    target.preferences = {}
+    mock_db.first.return_value = target
+
+    resp = client.patch(f"/admin/users/{target.id}/reactivate", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert target.status == UserStatus.pending_invite
+    assert target.invite_token
+    assert resp.json()["invite_token"] == target.invite_token
+    remaining = target.invite_token_expires_at - datetime.now(timezone.utc)
+    assert timedelta(days=6, hours=23) < remaining <= timedelta(days=7)
+
+
+def test_reactivate_activates_a_user_who_has_signed_in(client, auth_headers, mock_db, test_user):
+    """PATCH /admin/users/{id}/reactivate — anyone with a password comes back
+    active, with no invite link."""
+    test_user.is_superadmin = True
+    target = _mock_user("back@example.com")
+    target.status = UserStatus.deactivated
+    target.email_verified = True
+    target.invite_token = None
+    target.is_superadmin = False
+    target.preferences = {}
+    mock_db.first.return_value = target
+
+    resp = client.patch(f"/admin/users/{target.id}/reactivate", headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert target.status == UserStatus.active
+    assert target.invite_token is None
+
+
+def test_invite_rejects_a_name_longer_than_the_column(client, auth_headers, mock_db, test_user):
+    """POST /users/invite — a name past User.name's 255 characters is a 422.
+
+    Issue #318: InviteRequest.name had no bounds, so a long pasted name reached
+    the INSERT and came back as a DataError and a 500.
+    """
+    test_user.is_superadmin = True
+    mock_db.first.return_value = None
+
+    resp = client.post(
+        "/users/invite",
+        json={"email": "long@example.com", "name": "x" * 256},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 422
+    mock_db.add.assert_not_called()
+
+
+def test_invite_rejects_a_blank_name(client, auth_headers, mock_db, test_user):
+    """POST /users/invite — a whitespace-only name is refused, as on every other
+    path that writes a display name (#318)."""
+    test_user.is_superadmin = True
+    mock_db.first.return_value = None
+
+    resp = client.post(
+        "/users/invite",
+        json={"email": "blank@example.com", "name": "   "},
+        headers=auth_headers,
+    )
+
+    assert resp.status_code == 422
+    mock_db.add.assert_not_called()
+
+
+# flag_modified needs a mapped instance; test_user is a MagicMock.
+_FLAG_MODIFIED = "sqlalchemy.orm.attributes.flag_modified"
+
+
+def test_update_preferences_projects_view_saved_and_merged(client, auth_headers, test_user):
+    """PATCH /auth/me/preferences — projects_view is stored alongside existing keys."""
+    test_user.preferences = {"theme": "light"}
+
+    with patch(_FLAG_MODIFIED):
+        resp = client.patch(
+            "/auth/me/preferences",
+            json={"projects_view": {"layout": "list", "card_size": "L", "show_card_info": False}},
+            headers=auth_headers,
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["preferences"] == {
+        "theme": "light",
+        "projects_view": {"layout": "list", "card_size": "L", "show_card_info": False},
+    }
+
+
+def test_update_preferences_projects_view_show_card_info_optional(client, auth_headers, test_user):
+    """PATCH /auth/me/preferences — show_card_info may be omitted (clients from before the
+    toggle). It is left unset rather than stored, and the web app reads a missing value as on."""
+    with patch(_FLAG_MODIFIED):
+        resp = client.patch(
+            "/auth/me/preferences",
+            json={"projects_view": {"layout": "grid", "card_size": "M"}},
+            headers=auth_headers,
+        )
+
+    assert resp.status_code == 200
+    assert resp.json()["preferences"]["projects_view"] == {"layout": "grid", "card_size": "M"}
+
+
+def test_update_preferences_projects_view_rejects_invalid_layout(client, auth_headers, test_user):
+    """PATCH /auth/me/preferences — an unknown layout value is a 422, not stored."""
+    with patch(_FLAG_MODIFIED):
+        resp = client.patch(
+            "/auth/me/preferences",
+            json={"projects_view": {"layout": "carousel", "card_size": "M"}},
+            headers=auth_headers,
+        )
+
+    assert resp.status_code == 422
+    assert test_user.preferences == {}
+
+
+def test_update_preferences_projects_view_rejects_unknown_key(client, auth_headers, test_user):
+    """PATCH /auth/me/preferences — projects_view only accepts the keys it models."""
+    with patch(_FLAG_MODIFIED):
+        resp = client.patch(
+            "/auth/me/preferences",
+            json={"projects_view": {"layout": "grid", "card_size": "M", "aspect_ratio": "square"}},
+            headers=auth_headers,
+        )
+
+    assert resp.status_code == 422
+    assert test_user.preferences == {}
+
+
+def test_update_preferences_projects_view_saves_sort(client, auth_headers, test_user):
+    """PATCH /auth/me/preferences — the Projects page sort order is stored with the rest."""
+    view = {"layout": "grid", "card_size": "M", "show_card_info": True,
+            "sort_key": "name", "sort_direction": "asc"}
+    with patch(_FLAG_MODIFIED):
+        resp = client.patch("/auth/me/preferences", json={"projects_view": view}, headers=auth_headers)
+
+    assert resp.status_code == 200
+    assert resp.json()["preferences"]["projects_view"] == view
+
+
+def test_update_preferences_projects_view_rejects_unknown_sort_key(client, auth_headers, test_user):
+    """PATCH /auth/me/preferences — only date and name sorts apply to projects."""
+    with patch(_FLAG_MODIFIED):
+        resp = client.patch(
+            "/auth/me/preferences",
+            json={"projects_view": {"layout": "grid", "card_size": "M", "sort_key": "status"}},
+            headers=auth_headers,
+        )
+
+    assert resp.status_code == 422
+    assert test_user.preferences == {}
+
+
+def test_update_preferences_projects_view_rejects_unknown_sort_direction(client, auth_headers, test_user):
+    """PATCH /auth/me/preferences — a sort runs ascending or descending, nothing else."""
+    with patch(_FLAG_MODIFIED):
+        resp = client.patch(
+            "/auth/me/preferences",
+            json={"projects_view": {"layout": "grid", "card_size": "M", "sort_direction": "up"}},
+            headers=auth_headers,
+        )
+
+    assert resp.status_code == 422
+    assert test_user.preferences == {}

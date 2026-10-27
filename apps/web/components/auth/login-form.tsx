@@ -5,6 +5,7 @@ import { useRouter } from 'next/navigation'
 import { api, ApiError } from '@/lib/api'
 import { setTokens } from '@/lib/auth'
 import { useAuthStore } from '@/stores/auth-store'
+import { useBranding } from '@/components/shared/branding-provider'
 import { Button } from '@/components/ui/button'
 import { Input } from '@/components/ui/input'
 import { cn } from '@/lib/utils'
@@ -16,7 +17,10 @@ type Step = 'email' | 'code' | 'password' | 'classic'
 
 export function LoginForm() {
   const router = useRouter()
-  const [step, setStep] = useState<Step>('email')
+  const { defaultLoginMode } = useBranding()
+  const initialStep: Step = defaultLoginMode === 'password' ? 'classic' : 'email'
+  const [step, setStep] = useState<Step>(initialStep)
+  const choseStep = useRef(false)
   const [email, setEmail] = useState('')
   const [emailError, setEmailError] = useState('')
   const [code, setCode] = useState(['', '', '', '', '', ''])
@@ -39,6 +43,12 @@ export function LoginForm() {
   const [classicError, setClassicError] = useState('')
 
   const codeRefs = useRef<(HTMLInputElement | null)[]>([])
+
+  useEffect(() => {
+    if (choseStep.current || email || classicEmail || classicPassword) return
+    if (step === 'email' || step === 'classic') setStep(initialStep)
+    // eslint-disable-next-line react-hooks/exhaustive-deps
+  }, [initialStep])
 
   useEffect(() => {
     if (step === 'code') {
@@ -129,6 +139,10 @@ export function LoginForm() {
       })
 
       if (res.needs_password) {
+        // Persist the tokens issued by verify-magic-code before moving on:
+        // /auth/set-password requires an authenticated user (get_current_user),
+        // so without these the set-password call 401s and bounces the user out.
+        setTokens(res.access_token, res.refresh_token)
         setStep('password')
       } else {
         setTokens(res.access_token, res.refresh_token)
@@ -211,6 +225,10 @@ export function LoginForm() {
       setClassicError('Email and password are required')
       return
     }
+    if (!/^[^\s@]+@[^\s@]+\.[^\s@]+$/.test(classicEmail)) {
+      setClassicError('Enter a valid email address')
+      return
+    }
 
     setLoading(true)
     try {
@@ -239,7 +257,7 @@ export function LoginForm() {
     return (
       <div className="animate-slide-up">
         <div className="mb-8">
-          <h1 className="text-xl font-semibold text-text-primary mb-1">Sign in with password</h1>
+          <h1 className="text-xl font-semibold text-text-primary mb-1">Sign in</h1>
           <p className="text-sm text-text-secondary">Enter your email and password to continue.</p>
         </div>
 
@@ -276,10 +294,10 @@ export function LoginForm() {
         <div className="mt-6 text-center">
           <button
             type="button"
-            onClick={() => { setStep('email'); setClassicError('') }}
-            className="text-sm text-text-tertiary hover:text-text-secondary transition-colors"
+            onClick={() => { choseStep.current = true; setStep('email'); setClassicError('') }}
+            className="text-base text-text-tertiary hover:text-text-secondary transition-colors"
           >
-            Back to magic link
+            Sign in with magic code instead
           </button>
         </div>
       </div>
@@ -335,9 +353,16 @@ export function LoginForm() {
       <div className="animate-slide-up">
         <div className="mb-8">
           <h1 className="text-xl font-semibold text-text-primary mb-1">Check your email</h1>
+          {/* The API answers identically whether or not the address has an
+              account, deliberately, so that this endpoint cannot be used to
+              enumerate registered emails. Claiming "we sent a code" asserts
+              something it never told us, and for an unknown address it is
+              simply untrue: the person then waits for mail that cannot
+              arrive. Say only what the server guarantees. (#248) */}
           <p className="text-sm text-text-secondary">
-            We sent a 6-digit code to{' '}
+            If{' '}
             <span className="text-text-primary font-medium">{email}</span>
+            {' '}has an account, a 6-digit code is on its way.
           </p>
         </div>
 
@@ -364,8 +389,15 @@ export function LoginForm() {
             ))}
           </div>
 
-          {codeError && (
+          {codeError ? (
             <p className="text-sm text-status-error -mt-3">{codeError}</p>
+          ) : (
+            // A mistyped address is the common case behind "no code arrived",
+            // and it is the one thing the person can check without us telling
+            // them whether the account exists.
+            <p className="text-sm text-text-tertiary -mt-3">
+              Didn&apos;t get a code? Check the address for typos.
+            </p>
           )}
 
           <Button type="submit" size="lg" loading={loading} className="w-full">
@@ -377,7 +409,7 @@ export function LoginForm() {
           <button
             type="button"
             onClick={() => { setStep('email'); setCode(['', '', '', '', '', '']); setCodeError('') }}
-            className="block w-full text-sm text-text-tertiary hover:text-text-secondary transition-colors"
+            className="block w-full rounded-md border border-border bg-bg-secondary px-4 py-2.5 text-sm font-medium text-text-secondary transition-colors hover:border-border-focus hover:text-text-primary"
           >
             Use a different email
           </button>
@@ -386,11 +418,11 @@ export function LoginForm() {
     )
   }
 
-  // Step 1: Email
+  // Step: Email (magic code entry)
   return (
     <div className="animate-slide-up">
       <div className="mb-8">
-        <h1 className="text-xl font-semibold text-text-primary mb-1">Sign in to FreeFrame</h1>
+        <h1 className="text-xl font-semibold text-text-primary mb-1">Magic code sign-in</h1>
         <p className="text-sm text-text-secondary">
           Enter your email and we&apos;ll send you a sign-in code.
         </p>
@@ -443,8 +475,8 @@ export function LoginForm() {
       <div className="mt-4 text-center">
         <button
           type="button"
-          onClick={() => { setStep('classic'); setGeneralError('') }}
-          className="text-sm text-text-tertiary hover:text-text-secondary transition-colors"
+          onClick={() => { choseStep.current = true; setStep('classic'); setGeneralError('') }}
+          className="text-base text-text-tertiary hover:text-text-secondary transition-colors"
         >
           Sign in with password instead
         </button>

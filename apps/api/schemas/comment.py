@@ -1,7 +1,9 @@
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 import uuid
 from datetime import datetime
 from typing import Optional
+from ..models.comment import CommentVisibility
+from ..services.avatar_keys import sign_avatar
 
 class AnnotationData(BaseModel):
     drawing_data: dict  # Fabric.js canvas JSON
@@ -25,6 +27,8 @@ class GuestCommentCreate(BaseModel):
     timecode_start: Optional[float] = None
     timecode_end: Optional[float] = None
     body: str
+    # "internal" is accepted only from a signed-in caller who can open the asset.
+    visibility: CommentVisibility = CommentVisibility.public
     annotation: Optional[AnnotationData] = None
     guest_email: Optional[str] = None  # Not needed if user is logged in
     guest_name: Optional[str] = None
@@ -43,9 +47,11 @@ class AnnotationResponse(BaseModel):
 # ── Attachments ────────────────────────────────────────────────────────────────
 
 class AttachmentUploadRequest(BaseModel):
-    file_name: str
+    # Bounded because file_name is stored verbatim as original_filename and
+    # later echoed into a Content-Disposition header on the download URL.
+    file_name: str = Field(min_length=1, max_length=255)
     file_size: int
-    content_type: str
+    content_type: str = Field(max_length=255)
 
 class AttachmentUploadResponse(BaseModel):
     upload_url: str
@@ -82,6 +88,14 @@ class AuthorInfo(BaseModel):
     id: uuid.UUID
     name: str
     avatar_url: Optional[str] = None
+    avatar_color: Optional[str] = None
+
+    @model_validator(mode="after")
+    def resolve_avatar_url(self) -> "AuthorInfo":
+        # Same rule as UserResponse: sign only this author's own uploaded
+        # avatar, and show anything else as no avatar.
+        self.avatar_url = sign_avatar(self.id, self.avatar_url)
+        return self
 
 class GuestAuthorInfo(BaseModel):
     id: uuid.UUID

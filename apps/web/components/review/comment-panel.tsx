@@ -26,10 +26,19 @@ import {
   Check,
   Send,
   Lock,
+  Download,
 } from "lucide-react";
 import { cn, formatTime, formatRelativeTime } from "@/lib/utils";
 import { useReviewStore } from "@/stores/review-store";
+import type { Asset } from "@/types";
 import type { CommentWithReplies } from "@/hooks/use-comments";
+import {
+  exportComments,
+  FpsRequiredError,
+  type ExportFormat,
+} from "@/lib/export-comments";
+import { FpsPromptDialog } from "@/components/review/fps-prompt-dialog";
+import { Avatar } from "@/components/shared/avatar";
 
 // ─── Props ────────────────────────────────────────────────────────────────────
 
@@ -43,6 +52,40 @@ interface CommentPanelProps {
   onRemoveReaction: (commentId: string, emoji: string) => Promise<void>;
   onReply: (parentId: string) => void;
   onSubmitReply?: (parentId: string, body: string) => Promise<void>;
+  /** Compare mode: route comment-timecode clicks to a pane-scoped transport instead of the global store. */
+  onSeekToTimecode?: (time: number, pause?: boolean) => void;
+  /** Compare mode: route annotation display to a pane-scoped overlay instead of the global store. */
+  onShowAnnotation?: (drawingData: Record<string, unknown> | null) => void;
+  /** Compare mode: export this pane's version instead of the store's currentVersion. */
+  exportVersionId?: string;
+  /**
+   * Export this asset instead of the review store's `currentAsset`.
+   *
+   * Required wherever the panel is rendered outside the review screen. The
+   * store is written by `review-provider.tsx` and nothing clears it -- there is
+   * no unmount cleanup and the back arrow is a client-side navigation -- so on
+   * the project page it still holds whichever asset was opened last. Reading it
+   * there does not fail, it exports the wrong asset's comments under the wrong
+   * name, which is worse than doing nothing.
+   */
+  exportAsset?: Asset | null;
+  /**
+   * Whether to offer the comment export control. Defaults to true.
+   *
+   * `exportComments` authenticates with `Bearer ${getAccessToken()}` and nothing
+   * else, so on a share link, where the viewer is a guest with no token, the
+   * request can only 401. Set this false wherever the panel is rendered for
+   * someone who cannot authenticate, so the control is absent rather than
+   * present and guaranteed to fail.
+   */
+  canExport?: boolean;
+  /**
+   * Whether the viewer may delete other people's comments. Defaults to false.
+   *
+   * Mirrors `delete_comment`, which lets a project owner delete any comment on
+   * the project, guests' included. Delete only: editing stays with the author.
+   */
+  canModerate?: boolean;
   className?: string;
 }
 
@@ -88,12 +131,6 @@ function getAvatarColor(name: string): string {
     hash = name.charCodeAt(i) + ((hash << 5) - hash);
   }
   return AVATAR_COLORS[Math.abs(hash) % AVATAR_COLORS.length];
-}
-
-function getInitials(name: string): string {
-  const parts = name.trim().split(/\s+/);
-  if (parts.length === 1) return parts[0].charAt(0).toUpperCase();
-  return (parts[0].charAt(0) + parts[parts.length - 1].charAt(0)).toUpperCase();
 }
 
 // ─── useClickOutside ─────────────────────────────────────────────────────────
@@ -151,12 +188,14 @@ function Dropdown({
 
 function CommentMenu({
   isOwn,
+  canModerate,
   commentId,
   assetId,
   onEdit,
   onDelete,
 }: {
   isOwn: boolean;
+  canModerate?: boolean;
   commentId: string;
   assetId?: string;
   onEdit: () => void;
@@ -164,13 +203,14 @@ function CommentMenu({
 }) {
   const [open, setOpen] = React.useState(false);
 
-  // Only show menu for own comments — others only get emoji reactions
-  if (!isOwn) return null;
+  // Own comments, or any comment for a moderator. Everyone else only gets emoji reactions.
+  if (!isOwn && !canModerate) return null;
 
   return (
     <div className="relative">
       <button
         onClick={() => setOpen((p) => !p)}
+        aria-label="Comment actions"
         className="h-7 w-7 flex items-center justify-center rounded-full text-text-tertiary hover:text-text-secondary hover:bg-bg-tertiary transition-colors"
       >
         <MoreHorizontal className="h-4 w-4" />
@@ -181,13 +221,15 @@ function CommentMenu({
         align="right"
         className="w-44"
       >
-        <button
-          className="flex w-full items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-bg-tertiary transition-colors"
-          onClick={() => { onEdit(); setOpen(false) }}
-        >
-          <Pencil className="h-3.5 w-3.5" />
-          Edit
-        </button>
+        {isOwn && (
+          <button
+            className="flex w-full items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-bg-tertiary transition-colors"
+            onClick={() => { onEdit(); setOpen(false) }}
+          >
+            <Pencil className="h-3.5 w-3.5" />
+            Edit
+          </button>
+        )}
         <button
           className="flex w-full items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-bg-tertiary transition-colors"
           onClick={() => {
@@ -233,6 +275,7 @@ function InlineReplyInput({
 }) {
   const [body, setBody] = React.useState("");
   const [submitting, setSubmitting] = React.useState(false);
+  const [error, setError] = React.useState<string | null>(null);
   const [emojiOpen, setEmojiOpen] = React.useState(false);
   const inputRef = React.useRef<HTMLInputElement>(null);
   const emojiRef = React.useRef<HTMLDivElement>(null);
@@ -257,12 +300,17 @@ function InlineReplyInput({
     const trimmed = body.trim();
     if (!trimmed || submitting) return;
     setSubmitting(true);
+    setError(null);
     try {
       await onSubmit(parentId, trimmed);
       setBody("");
       onCancel();
-    } catch {
-      // error handled upstream
+    } catch (e) {
+      // Keep the typed reply and say why. Nothing upstream reported a failed
+      // reply, so it looked sent. An Error with an empty message is a
+      // deliberate quiet abort (e.g. the guest dismissed the name prompt).
+      const message = e instanceof Error ? e.message : "Couldn't send the reply";
+      setError(message || null);
     } finally {
       setSubmitting(false);
     }
@@ -273,7 +321,7 @@ function InlineReplyInput({
       <input
         ref={inputRef}
         type="text"
-        className="w-full rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-[13px] text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20"
+        className="w-full rounded-lg border border-border bg-bg-tertiary px-3 py-2 text-[16px] [@media(hover:hover)]:text-[13px] text-text-primary placeholder:text-text-tertiary focus:outline-none focus:border-accent/50 focus:ring-1 focus:ring-accent/20"
         placeholder="Leave your reply here..."
         value={body}
         onChange={(e) => setBody(e.target.value)}
@@ -285,6 +333,11 @@ function InlineReplyInput({
           if (e.key === "Escape") onCancel();
         }}
       />
+      {error && (
+        <p role="alert" className="mt-1.5 text-[12px] text-status-error">
+          {error}
+        </p>
+      )}
       <div className="flex items-center justify-between mt-2">
         <div className="flex items-center gap-1">
           <button className="h-7 w-7 flex items-center justify-center rounded-md text-text-tertiary hover:bg-bg-tertiary hover:text-text-secondary transition-colors">
@@ -299,7 +352,7 @@ function InlineReplyInput({
               <Smile className="h-4 w-4" />
             </button>
             {emojiOpen && (
-              <div className="absolute bottom-full left-1/2 -translate-x-1/2 mb-2 z-50 rounded-lg border border-border bg-bg-elevated shadow-2xl p-1.5 animate-in fade-in zoom-in-95 duration-100 w-[200px]">
+              <div className="absolute bottom-full left-1/2 -translate-x-1/2 slide-in-from-left-1/2 mb-2 z-50 rounded-lg border border-border bg-bg-elevated shadow-2xl p-1.5 animate-in fade-in zoom-in-95 duration-100 w-[200px]">
                 <div className="grid grid-cols-8 gap-px">
                   {REPLY_EMOJIS.map((e) => (
                     <button
@@ -346,6 +399,7 @@ interface CommentItemProps {
   commentNumber?: number;
   depth?: number;
   currentUserId?: string;
+  canModerate?: boolean;
   replyingTo?: string | null;
   isFocused?: boolean;
   onResolve: (commentId: string) => Promise<void>;
@@ -355,6 +409,8 @@ interface CommentItemProps {
   onReply: (parentId: string) => void;
   onCancelReply: () => void;
   onSubmitReply?: (parentId: string, body: string) => Promise<void>;
+  onSeekToTimecode?: (time: number, pause?: boolean) => void;
+  onShowAnnotation?: (drawingData: Record<string, unknown> | null) => void;
 }
 
 function CommentItem({
@@ -362,6 +418,7 @@ function CommentItem({
   commentNumber,
   depth = 0,
   currentUserId,
+  canModerate,
   replyingTo,
   isFocused,
   onResolve,
@@ -371,9 +428,13 @@ function CommentItem({
   onReply,
   onCancelReply,
   onSubmitReply,
+  onSeekToTimecode,
+  onShowAnnotation,
 }: CommentItemProps) {
-  const seekTo = useReviewStore((s) => s.seekTo);
+  const storeSeekTo = useReviewStore((s) => s.seekTo);
+  const seekTo = onSeekToTimecode ?? storeSeekTo;
   const setActiveAnnotation = useReviewStore((s) => s.setActiveAnnotation);
+  const showAnnotation = onShowAnnotation ?? setActiveAnnotation;
   const setFocusedCommentId = useReviewStore((s) => s.setFocusedCommentId);
   const itemRef = React.useRef<HTMLDivElement>(null);
   const [showReplies, setShowReplies] = React.useState(true);
@@ -455,21 +516,19 @@ function CommentItem({
         ) {
           seekTo(comment.timecode_start, true);
         }
-        setActiveAnnotation(
+        showAnnotation(
           comment.annotation ? comment.annotation.drawing_data : null,
         );
       }}
     >
       <div className="flex gap-2.5 py-3">
-        {/* Colored avatar */}
-        <div
-          className={cn(
-            "h-8 w-8 rounded-full flex items-center justify-center text-[11px] font-bold text-text-inverse shrink-0 mt-0.5",
-            avatarColor,
-          )}
-        >
-          {getInitials(authorName)}
-        </div>
+        {/* Profile picture, else initials on the author's colour */}
+        <Avatar
+          src={comment.author?.avatar_url}
+          name={authorName}
+          color={comment.author?.avatar_color}
+          className={cn("text-[11px] font-bold text-text-inverse mt-0.5", avatarColor)}
+        />
 
         <div className="flex-1 min-w-0">
           {/* Header row */}
@@ -504,7 +563,7 @@ function CommentItem({
                     seekTo(comment.timecode_start!, true);
                     setFocusedCommentId(comment.id);
                     if (comment.annotation) {
-                      setActiveAnnotation(comment.annotation.drawing_data);
+                      showAnnotation(comment.annotation.drawing_data);
                     }
                   }}
                   title="Jump to timecode"
@@ -521,7 +580,7 @@ function CommentItem({
               <button
                 className="inline-flex items-center justify-center h-5 w-5 rounded text-purple-400/70 hover:text-purple-400 hover:bg-purple-500/15 transition-colors"
                 onClick={() => {
-                  setActiveAnnotation(comment.annotation!.drawing_data);
+                  showAnnotation(comment.annotation!.drawing_data);
                   setFocusedCommentId(comment.id);
                   if (
                     comment.timecode_start !== null &&
@@ -545,7 +604,7 @@ function CommentItem({
                 onChange={(e) => setEditBody(e.target.value)}
                 autoFocus
                 rows={2}
-                className="w-full rounded-md border border-border bg-bg-tertiary px-2 py-1.5 text-[13px] text-text-primary placeholder:text-text-tertiary outline-none focus:border-accent/50 resize-none"
+                className="w-full rounded-md border border-border bg-bg-tertiary px-2 py-1.5 text-[16px] [@media(hover:hover)]:text-[13px] text-text-primary placeholder:text-text-tertiary outline-none focus:border-accent/50 resize-none"
               />
               <div className="flex items-center gap-1.5 mt-1">
                 <button
@@ -601,7 +660,9 @@ function CommentItem({
 
           {/* Action row: Reply text + hover icons */}
           <div className="mt-1.5 flex items-center gap-2">
-            {depth === 0 && (
+            {/* No submit handler means nowhere to send a reply (a view-only
+                share link), so don't offer one. */}
+            {depth === 0 && onSubmitReply && (
               <button
                 className="text-[13px] font-medium text-text-tertiary hover:text-text-secondary transition-colors"
                 onClick={() => onReply(comment.id)}
@@ -639,6 +700,7 @@ function CommentItem({
               <div className="opacity-0 group-hover/comment:opacity-100 transition-opacity">
                 <CommentMenu
                   isOwn={isOwn}
+                  canModerate={canModerate}
                   commentId={comment.id}
                   assetId={comment.asset_id}
                   onEdit={() => { setEditing(true); setEditBody(comment.body); }}
@@ -703,6 +765,7 @@ function CommentItem({
                   comment={reply}
                   depth={depth + 1}
                   currentUserId={currentUserId}
+                  canModerate={canModerate}
                   replyingTo={replyingTo}
                   onResolve={onResolve}
                   onDelete={onDelete}
@@ -711,6 +774,8 @@ function CommentItem({
                   onReply={onReply}
                   onCancelReply={onCancelReply}
                   onSubmitReply={onSubmitReply}
+                  onSeekToTimecode={onSeekToTimecode}
+                  onShowAnnotation={onShowAnnotation}
                 />
               ))}
             </div>
@@ -724,7 +789,7 @@ function CommentItem({
 // ─── Types ───────────────────────────────────────────────────────────────────
 
 type CommentVisibility = "all" | "public" | "internal";
-type SortMode = "oldest" | "newest" | "commenter" | "completed";
+type SortMode = "timecode" | "oldest" | "newest" | "commenter" | "completed";
 
 interface FilterState {
   annotations: boolean;
@@ -756,11 +821,23 @@ export function CommentPanel({
   onRemoveReaction,
   onReply,
   onSubmitReply,
+  onSeekToTimecode,
+  onShowAnnotation,
+  exportVersionId,
+  exportAsset,
+  canExport = true,
+  canModerate = false,
   className,
 }: CommentPanelProps) {
   const focusedCommentId = useReviewStore((s) => s.focusedCommentId);
   const setFocusedCommentId = useReviewStore((s) => s.setFocusedCommentId);
   const setActiveAnnotation = useReviewStore((s) => s.setActiveAnnotation);
+  const storeAsset = useReviewStore((s) => s.currentAsset);
+  // The prop wins where it is given. `undefined` means "not told", so the store
+  // is used; an explicit `null` means "told, and there is nothing selected",
+  // which must not silently fall through to whatever the store still holds.
+  const currentAsset = exportAsset !== undefined ? exportAsset : storeAsset;
+  const currentVersion = useReviewStore((s) => s.currentVersion);
 
   // Toolbar state
   const [visibility, setVisibility] = React.useState<CommentVisibility>("all");
@@ -769,9 +846,22 @@ export function CommentPanel({
   const [sortOpen, setSortOpen] = React.useState(false);
   const [searchOpen, setSearchOpen] = React.useState(false);
   const [searchQuery, setSearchQuery] = React.useState("");
-  const [sortMode, setSortMode] = React.useState<SortMode>("oldest");
+  const [sortMode, setSortMode] = React.useState<SortMode>("timecode");
   const [filters, setFilters] = React.useState<FilterState>(EMPTY_FILTERS);
   const [replyingTo, setReplyingTo] = React.useState<string | null>(null);
+  const [exportOpen, setExportOpen] = React.useState(false);
+  const [exportError, setExportError] = React.useState<string | null>(null);
+  const [fpsPromptFormat, setFpsPromptFormat] =
+    React.useState<ExportFormat | null>(null);
+
+  // The refusal is about one asset and one version, so it has to go when
+  // either of them changes. Nothing here remounts on its own: the version
+  // switcher is a sibling of this panel with no `key`, so a message about v2
+  // would otherwise sit above v1's fully timecoded comments, and in compare
+  // mode above the other pane's.
+  React.useEffect(() => {
+    setExportError(null);
+  }, [currentAsset?.id, currentVersion?.id, exportVersionId]);
 
   const searchRef = React.useRef<HTMLInputElement>(null);
 
@@ -840,7 +930,12 @@ export function CommentPanel({
         if (a.resolved && !b.resolved) return -1;
         if (!a.resolved && b.resolved) return 1;
       }
-      // Default: oldest / timecoded first
+      if (sortMode === "oldest")
+        return (
+          new Date(a.created_at).getTime() - new Date(b.created_at).getTime()
+        );
+      // Default (sortMode === "timecode"): timecoded ascending, then
+      // untimecoded last (by created_at ascending).
       const aHasTime =
         a.timecode_start !== null && a.timecode_start !== undefined;
       const bHasTime =
@@ -871,7 +966,45 @@ export function CommentPanel({
     onReply(parentId);
   }
 
+  async function handleExport(format: ExportFormat, fps?: number) {
+    setExportOpen(false);
+    setExportError(null);
+    const versionId = exportVersionId ?? currentVersion?.id;
+    if (!currentAsset || !versionId) {
+      // Folded into the error line rather than returning ahead of it: a guard
+      // that returns silently is the shape of bug this panel just had.
+      setExportError("Select an asset to export its comments");
+      return;
+    }
+    try {
+      await exportComments({
+        assetId: currentAsset.id,
+        versionId,
+        format,
+        fps,
+      });
+    } catch (err) {
+      if (err instanceof FpsRequiredError) {
+        setFpsPromptFormat(format);
+      } else {
+        // Every other export failure used to go to the console, where nobody
+        // looks: an unsupported frame rate, a non-video asset and a version with
+        // nothing timecoded all produced a click that did nothing at all. Shown
+        // in the panel rather than as a toast, next to the control that failed
+        // and alongside the fps prompt, which is where this component already
+        // answers for this button.
+        // `err.message` and not `err instanceof Error` alone: an Error with an
+        // empty message is falsy, and the line below renders on truthiness --
+        // so the branch meant to explain the failure would show nothing at all.
+        setExportError(
+          (err instanceof Error && err.message) || "Export failed",
+        );
+      }
+    }
+  }
+
   return (
+    <>
     <div className={cn("flex flex-col flex-1 min-h-0", className)}>
       {/* ─── Toolbar ──────────────────────────────────────────────── */}
       <div className="flex items-center justify-between px-4 py-2.5 shrink-0">
@@ -1070,7 +1203,8 @@ export function CommentPanel({
                 Sort thread by...
               </div>
               {[
-                { id: "oldest" as const, label: "Oldest (Default)" },
+                { id: "timecode" as const, label: "Timecode (Default)" },
+                { id: "oldest" as const, label: "Oldest" },
                 { id: "newest" as const, label: "Newest" },
                 { id: "commenter" as const, label: "Commenter" },
                 { id: "completed" as const, label: "Completed" },
@@ -1114,8 +1248,77 @@ export function CommentPanel({
             <Search className="h-4 w-4" />
           </button>
 
+          {/* Export */}
+          {canExport && (
+            <div className="relative">
+              <button
+                className={cn(
+                  "h-7 w-7 flex items-center justify-center rounded-md transition-colors",
+                  exportOpen
+                    ? "text-accent bg-accent/10"
+                    : "text-text-tertiary hover:text-text-secondary hover:bg-bg-tertiary",
+                )}
+                title="Export comments"
+                onClick={() => {
+                  // Opening the menu is the start of a new attempt, so the
+                  // previous refusal stops being the answer to anything.
+                  if (!exportOpen) setExportError(null);
+                  setExportOpen((p) => !p);
+                  setVisOpen(false);
+                  setFilterOpen(false);
+                  setSortOpen(false);
+                }}
+              >
+                <Download className="h-4 w-4" />
+              </button>
+              <Dropdown
+                open={exportOpen}
+                onClose={() => setExportOpen(false)}
+                align="right"
+                className="w-56"
+              >
+                <div className="px-3 py-2 text-[11px] text-text-tertiary uppercase tracking-wider font-medium">
+                  Export comments
+                </div>
+                {currentAsset?.asset_type === "video" && (
+                  <>
+                    <button
+                      className="flex w-full items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-bg-tertiary transition-colors"
+                      onClick={() => handleExport("edl")}
+                    >
+                      DaVinci Resolve (EDL)
+                    </button>
+                    <button
+                      className="flex w-full items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-bg-tertiary transition-colors"
+                      onClick={() => handleExport("fcpxml")}
+                    >
+                      Final Cut Pro (FCPXML)
+                    </button>
+                    <button
+                      className="flex w-full items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-bg-tertiary transition-colors"
+                      onClick={() => handleExport("premiere_xml")}
+                    >
+                      Premiere Pro (XML)
+                    </button>
+                  </>
+                )}
+                <button
+                  className="flex w-full items-center gap-2.5 px-3 py-2 text-[13px] text-text-secondary hover:bg-bg-tertiary transition-colors"
+                  onClick={() => handleExport("csv")}
+                >
+                  CSV
+                </button>
+              </Dropdown>
+            </div>
+          )}
         </div>
       </div>
+
+      {exportError && (
+        <div className="px-4 pb-2 shrink-0">
+          <p className="text-[11px] text-status-error">{exportError}</p>
+        </div>
+      )}
 
       {/* ─── Search bar ───────────────────────────────────────────── */}
       {searchOpen && (
@@ -1125,7 +1328,7 @@ export function CommentPanel({
             <input
               ref={searchRef}
               type="text"
-              className="flex-1 bg-transparent text-[13px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
+              className="flex-1 bg-transparent text-[16px] [@media(hover:hover)]:text-[13px] text-text-primary placeholder:text-text-tertiary focus:outline-none"
               placeholder="Search..."
               value={searchQuery}
               onChange={(e) => setSearchQuery(e.target.value)}
@@ -1180,6 +1383,7 @@ export function CommentPanel({
                 comment={comment}
                 commentNumber={index + 1}
                 currentUserId={currentUserId}
+                canModerate={canModerate}
                 replyingTo={replyingTo}
                 isFocused={focusedCommentId === comment.id}
                 onResolve={onResolve}
@@ -1189,10 +1393,20 @@ export function CommentPanel({
                 onReply={handleReply}
                 onCancelReply={() => setReplyingTo(null)}
                 onSubmitReply={onSubmitReply}
+                onSeekToTimecode={onSeekToTimecode}
+                onShowAnnotation={onShowAnnotation}
               />
             </div>
           ))}
       </div>
     </div>
+    <FpsPromptDialog
+      open={fpsPromptFormat !== null}
+      onOpenChange={(open) => !open && setFpsPromptFormat(null)}
+      onConfirm={(fps) =>
+        fpsPromptFormat && handleExport(fpsPromptFormat, fps)
+      }
+    />
+    </>
   );
 }

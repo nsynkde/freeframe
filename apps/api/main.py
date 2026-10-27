@@ -1,16 +1,54 @@
+import logging
 import os
+import re
+import threading
 from contextlib import asynccontextmanager
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
 from .config import settings
-from .routers import auth, users, projects, upload, events, assets, me, comments, approvals, share, metadata, branding, notifications, admin, setup, folders, hls_proxy
-from .services.s3_service import ensure_bucket_exists
+from .routers import auth, users, projects, upload, events, assets, me, comments, approvals, share, metadata, branding, instance_branding, notifications, admin, setup, folders, hls_proxy, instance_settings
+from .services.s3_service import run_startup_bucket_setup
+from .services.email_service import mail_is_configured
 from .middleware.global_rate_limit import GlobalRateLimitMiddleware
 from .middleware.setup_guard import SetupGuardMiddleware
 
+
+# Paths whose next segment is a credential: an invite token sets the account's
+# password, and a share token opens the link.
+_TOKEN_IN_PATH = re.compile(r"^(/auth/invite/|/share/)[^/]+")
+
+
+class _DropQueryStringFilter(logging.Filter):
+    """Keep credentials out of the access log. Some URLs carry them in the query
+    string, because the client cannot send a header there: `?token=` on /hls
+    (hls.js segment fetches) and /events (EventSource), `?share_session=` on the
+    share routes. Others carry one in the path (`_TOKEN_IN_PATH`), which is
+    replaced with `<redacted>`. uvicorn logs the path with its query as the
+    third argument."""
+
+    def filter(self, record: logging.LogRecord) -> bool:
+        args = record.args
+        if isinstance(args, tuple) and len(args) >= 3 and isinstance(args[2], str):
+            path = _TOKEN_IN_PATH.sub(r"\1<redacted>", args[2].split("?", 1)[0])
+            record.args = args[:2] + (path,) + args[3:]
+        return True
+
+
+# On the logger rather than a handler: gunicorn's UvicornWorker replaces this
+# logger's handlers with its own (--access-logfile) but leaves its filters alone.
+logging.getLogger("uvicorn.access").addFilter(_DropQueryStringFilter())
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
-    ensure_bucket_exists()
+    # Run bucket setup off the request path (daemon thread) so a slow or unreachable
+    # object store can't block app startup (deploy-test finding #6).
+    threading.Thread(target=run_startup_bucket_setup, name="s3-bucket-setup", daemon=True).start()
+    if not mail_is_configured():
+        logging.getLogger("apps.api.startup").warning(
+            "Email is not configured (MAIL_PROVIDER=%s) — magic-code login and invites "
+            "will FAIL until you configure SMTP or SES. See docs/deployment.md.",
+            settings.mail_provider,
+        )
     yield
 
 _disable_docs = os.getenv("DISABLE_DOCS", "").lower() in ("true", "1", "yes")
@@ -27,21 +65,45 @@ app = FastAPI(
     openapi_url=None if _disable_docs else "/openapi.json",
 )
 
+# Surface an obvious warning when the interactive API docs + OpenAPI schema
+# are exposed on a production frontend. The schema enumerates every endpoint
+# and Pydantic field on the app, which is a significant attack-surface leak
+# when FRONTEND_URL is a public hostname. The /docs,/redoc,/openapi.json
+# endpoints should be disabled in production via DISABLE_DOCS=true.
+if not _disable_docs:
+    from urllib.parse import urlparse
+    _fu = (settings.frontend_url or "").strip()
+    _fh = (urlparse(_fu).hostname or "").lower()
+    if _fh and _fh not in ("localhost", "127.0.0.1", "0.0.0.0"):
+        logging.getLogger("apps.api.startup").warning(
+            "FastAPI docs and OpenAPI schema are ENABLED at /docs, /redoc, "
+            "/openapi.json with FRONTEND_URL=%r (non-localhost). Set "
+            "DISABLE_DOCS=true in production to suppress this exposure.",
+            _fu,
+        )
+
+if settings.cors_allows_any_origin:
+    # Allow any origin. A literal "*" can't be combined with allow_credentials,
+    # so echo the request origin via regex instead (keeps credentialed requests working).
+    _cors_origin_kwargs = {"allow_origin_regex": ".*"}
+else:
+    _cors_origin_kwargs = {"allow_origins": settings.cors_origins}
+
+app.add_middleware(GlobalRateLimitMiddleware)
+app.add_middleware(SetupGuardMiddleware)
+# add_middleware prepends, so the one added last runs first. CORS has to be
+# outermost: the limiter's 429 and the setup guard's 503 are returned without
+# reaching anything inside them, and without CORS headers the browser hides
+# the status (and Retry-After) behind a network error (#525). It also answers
+# preflights before they count against the read limit.
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=[
-        settings.frontend_url,
-        "http://localhost:3000",
-        "http://localhost:3001",
-        "null",  # Figma plugin webview sends Origin: null
-        *settings.cors_extra_origins,
-    ],
+    **_cors_origin_kwargs,
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
+    expose_headers=["Content-Disposition", "Retry-After"],
 )
-app.add_middleware(GlobalRateLimitMiddleware)
-app.add_middleware(SetupGuardMiddleware)
 
 app.include_router(auth.router)
 app.include_router(users.router)
@@ -60,6 +122,8 @@ app.include_router(admin.router)
 app.include_router(setup.router)
 app.include_router(folders.router)
 app.include_router(hls_proxy.router)
+app.include_router(instance_settings.router)
+app.include_router(instance_branding.router)
 
 @app.get("/health")
 def health():

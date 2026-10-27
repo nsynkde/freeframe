@@ -1,6 +1,8 @@
 """Admin endpoints for user management."""
 
-from datetime import datetime
+from datetime import datetime, timedelta, timezone
+import secrets
+
 from fastapi import APIRouter, Depends, HTTPException, status
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
@@ -11,7 +13,11 @@ from ..database import get_db
 from ..middleware.auth import get_current_user
 from ..models.user import User, UserStatus
 from ..models.api_token import ApiToken, generate_token
-from ..schemas.auth import UserResponse, UpdateUserRoleRequest
+from ..schemas.auth import UserResponse, AdminUserResponse, UpdateUserRoleRequest
+from .users import require_admin
+from ..tasks.celery_app import send_task_safe
+from ..tasks.cleanup_tasks import cleanup_soft_deleted
+from ..schemas.admin import PurgeStartResponse
 
 router = APIRouter(prefix="/admin", tags=["admin"])
 
@@ -88,7 +94,7 @@ def revoke_api_token(
 
 # ── Endpoints ──────────────────────────────────────────────────────────────────
 
-@router.get("/users", response_model=list[UserResponse])
+@router.get("/users", response_model=list[AdminUserResponse])
 def list_all_users(
     db: Session = Depends(get_db),
     current_user: User = Depends(get_current_user),
@@ -103,7 +109,7 @@ def list_all_users(
     users = db.query(User).filter(User.deleted_at.is_(None)).all()
     return users
 
-@router.patch("/users/{user_id}/deactivate", response_model=UserResponse)
+@router.patch("/users/{user_id}/deactivate", response_model=AdminUserResponse)
 def deactivate_user(
     user_id: uuid.UUID,
     db: Session = Depends(get_db),
@@ -128,11 +134,15 @@ def deactivate_user(
         raise HTTPException(status_code=404, detail="User not found")
 
     user.status = UserStatus.deactivated
+    # Deactivating a pending invitee withdraws the invite, so a later
+    # Reactivate doesn't bring the old link back to life.
+    user.invite_token = None
+    user.invite_token_expires_at = None
     db.commit()
     db.refresh(user)
     return user
 
-@router.patch("/users/{user_id}/reactivate", response_model=UserResponse)
+@router.patch("/users/{user_id}/reactivate", response_model=AdminUserResponse)
 def reactivate_user(
     user_id: uuid.UUID,
     db: Session = Depends(get_db),
@@ -149,12 +159,19 @@ def reactivate_user(
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
 
-    user.status = UserStatus.active
+    if user.password_hash is None and not user.email_verified:
+        # An invitee who never accepted has no way in once deactivation cleared
+        # their link, so they go back to pending with a fresh one to copy.
+        user.status = UserStatus.pending_invite
+        user.invite_token = secrets.token_urlsafe(48)
+        user.invite_token_expires_at = datetime.now(timezone.utc) + timedelta(days=7)
+    else:
+        user.status = UserStatus.active
     db.commit()
     db.refresh(user)
     return user
 
-@router.patch("/users/{user_id}/role", response_model=UserResponse)
+@router.patch("/users/{user_id}/role", response_model=AdminUserResponse)
 def update_user_role(
     user_id: uuid.UUID,
     body: UpdateUserRoleRequest,
@@ -183,3 +200,19 @@ def update_user_role(
     db.commit()
     db.refresh(user)
     return user
+
+@router.post("/purge", response_model=PurgeStartResponse, status_code=status.HTTP_202_ACCEPTED)
+def purge_now(current_user: User = Depends(require_admin)):
+    """Trigger the retention-window garbage collector to run now, in the background.
+
+    Superadmin only. Enqueues the same `cleanup_soft_deleted` task the daily beat runs, so the
+    request returns immediately instead of blocking on a potentially long cascade + S3 deletes.
+    Reclaimed counts are logged by the worker. If a purge is already running (e.g. the daily beat),
+    the advisory lock serializes purges and this enqueued run is skipped rather than double-cascading,
+    so a 202 here means "enqueued", not "a fresh run happened".
+    """
+    send_task_safe(cleanup_soft_deleted)
+    return PurgeStartResponse(
+        status="started",
+        detail="Retention garbage collection is running in the background; see worker logs for reclaimed counts.",
+    )

@@ -48,6 +48,7 @@ export interface User {
   email: string;
   name: string;
   avatar_url: string | null;
+  avatar_color: string | null;
   status: UserStatus;
   is_superadmin: boolean;
   email_verified: boolean;
@@ -55,6 +56,15 @@ export interface User {
   preferences: Record<string, unknown>;
   created_at: string;
   deleted_at: string | null;
+}
+
+export interface InstanceSettings {
+  storage_limit_bytes: number;
+  storage_used_bytes: number;
+  /** Admins only. 0 sizes upload parts from each file; anything else is fixed. */
+  upload_part_size_bytes?: number;
+  /** Admins only. Whether people outside a project may download originals. */
+  allow_original_downloads?: boolean;
 }
 
 export interface Team {
@@ -122,6 +132,8 @@ export interface Asset {
   created_at: string;
   updated_at: string;
   deleted_at: string | null;
+  /** Comments on the latest version, replies included, as its comment panel shows them. */
+  comment_count?: number;
 }
 
 export interface AssetVersion {
@@ -132,6 +144,8 @@ export interface AssetVersion {
   created_by: string;
   created_at: string;
   deleted_at: string | null;
+  /** When the upload last moved; see `mergeHistoryAssets`. */
+  last_activity_at?: string | null;
   files?: MediaFile[];
 }
 
@@ -159,6 +173,15 @@ export interface MediaFile {
   created_at: string;
 }
 
+/** One file a version can be downloaded as: the original, or a transcode. */
+export interface DownloadOption {
+  /** "original" or "transcode"; passed back as `rendition` when downloading. */
+  id: string;
+  label: string;
+  format: string;
+  size_bytes: number | null;
+}
+
 export interface CarouselItem {
   id: string;
   version_id: string;
@@ -179,6 +202,7 @@ export interface CommentAuthor {
   id: string;
   name: string;
   avatar_url: string | null;
+  avatar_color?: string | null;
 }
 
 export interface GuestAuthor {
@@ -302,6 +326,12 @@ export interface ShareLinkListItem {
   target_name: string
   view_count: number
   last_viewed_at: string | null
+  created_at: string
+  expires_at: string | null
+  /** True once expires_at has passed: the share page no longer opens the link. */
+  is_expired: boolean
+  /** Only when the list was asked about one asset: how this link shows it. */
+  contains_asset?: "direct" | "indirect" | null
 }
 
 export type ShareActivityAction = "opened" | "viewed_asset" | "commented" | "approved" | "rejected" | "downloaded"
@@ -314,6 +344,8 @@ export interface ShareLinkActivity {
   actor_name: string | null
   asset_id: string | null
   asset_name: string | null
+  /** For a download: "original" or "transcode". Null on older rows. */
+  rendition?: string | null
   created_at: string
 }
 
@@ -325,6 +357,7 @@ export interface FolderShareAssetItem {
   file_size: number | null
   duration_seconds: number | null
   comment_count: number
+  version_count?: number
   created_by_name: string | null
   created_at: string
 }
@@ -415,24 +448,36 @@ export interface Notification {
   created_at: string;
   asset_name: string | null;
   actor_name: string | null;
+  actor_is_guest?: boolean;
   comment_preview: string | null;
   project_id: string | null;
 }
 
 // ─── Branding & Watermarking ──────────────────────────────────────────────────
 
+/** GET/PUT /projects/{id}/branding. */
 export interface ProjectBranding {
   id: string;
   project_id: string;
   logo_s3_key: string | null;
+  /** A signed URL for `logo_s3_key`, or null when there is no logo. */
+  logo_url: string | null;
   primary_color: string | null;
   secondary_color: string | null;
   custom_title: string | null;
   custom_footer: string | null;
   viewer_layout: ViewerLayout;
   featured_field: string | null;
-  created_at: string;
-  updated_at: string;
+  /** Share pages show the project cover as their logo when one is set. */
+  use_cover_as_logo: boolean;
+}
+
+/** The project branding a share link's validate response carries, for every link type. */
+export interface ShareBranding {
+  /** Already resolved by the API: the cover when the project uses it, else the logo. */
+  logo_url: string | null;
+  primary_color: string | null;
+  custom_footer: string | null;
 }
 
 export interface WatermarkSettings {
