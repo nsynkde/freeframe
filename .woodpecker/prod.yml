@@ -1,5 +1,7 @@
 when:
-    event: manual
+  - event: push
+    branch: main
+  - event: manual
 
 steps:
   - name: build-push-api
