@@ -227,9 +227,11 @@ def ensure_bucket_exists():
                             # browser upload + multipart flows actually send.
                             # Silo and Garage enforce this list: a new header
                             # the browser sends to storage must be added here.
+                            # Lowercase: browsers send Access-Control-Request-Headers
+                            # lowercased and Garage matches them case-sensitively.
                             "AllowedHeaders": [
-                                "Content-Type",
-                                "Content-MD5",
+                                "content-type",
+                                "content-md5",
                                 "x-amz-content-sha256",
                                 "x-amz-date",
                                 "x-amz-decoded-content-length",
